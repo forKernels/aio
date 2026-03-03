@@ -7,7 +7,7 @@ const assert = std.debug.assert;
 
 const is_linux = builtin.target.os.tag == .linux;
 
-pub const Address = std.Io.net.IpAddress;
+pub const Address = std.net.Address;
 
 pub const TCPOptions = struct {
     rcvbuf: c_int,

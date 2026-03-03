@@ -4,9 +4,10 @@ const assert = std.debug.assert;
 const log = std.log.scoped(.io);
 const constants = @import("../constants.zig");
 const common = @import("./common.zig");
-const Address = std.Io.net.IpAddress;
+const Address = std.net.Address;
 
-const QueueType = @import("../queue.zig").QueueType;
+const queue_mod = @import("../queue.zig");
+const QueueType = queue_mod.QueueType;
 const Time = @import("../time.zig").Time;
 const buffer_limit = @import("../io.zig").buffer_limit;
 const DirectIO = @import("../io.zig").DirectIO;
@@ -15,8 +16,8 @@ pub const IO = struct {
     iocp: os.windows.HANDLE,
     timer: Time = .{},
     io_pending: usize = 0,
-    timeouts: QueueType(Completion) = .{ .name = "io_timeouts" },
-    completed: QueueType(Completion) = .{ .name = "io_completed" },
+    timeouts: QueueType(Completion) = QueueType(Completion).init(.{ .name = "io_timeouts" }),
+    completed: QueueType(Completion) = QueueType(Completion).init(.{ .name = "io_completed" }),
 
     pub fn init(entries: u12, flags: u32) !IO {
         _ = entries;
@@ -121,7 +122,7 @@ pub const IO = struct {
                         raw_overlapped,
                     );
                     const completion = overlapped.completion;
-                    completion.next = null;
+                    completion.link = .{};
                     self.completed.push(completion);
                 }
             }
@@ -143,11 +144,12 @@ pub const IO = struct {
     fn flush_timeouts(self: *IO) ?u64 {
         var min_expires: ?u64 = null;
         var current_time: ?u64 = null;
-        var timeouts: ?*Completion = self.timeouts.peek();
+        // Iterate through the timeout queue using the intrusive link field
+        var ql: ?*QueueType(Completion).Link = self.timeouts.any.out;
 
-        // iterate through the timeouts, returning min_expires at the end
-        while (timeouts) |completion| {
-            timeouts = completion.next;
+        while (ql) |q| {
+            const completion: *Completion = @alignCast(@fieldParentPtr("link", q));
+            ql = q.next; // save next before possible removal
 
             // lazily get the current time
             const now = current_time orelse self.timer.monotonic();
@@ -174,7 +176,7 @@ pub const IO = struct {
 
     /// This struct holds the data needed for a single IO operation
     pub const Completion = struct {
-        next: ?*Completion,
+        link: QueueType(Completion).Link = .{},
         context: ?*anyopaque,
         callback: *const fn (Context) void,
         operation: Operation,
@@ -238,7 +240,7 @@ pub const IO = struct {
         comptime callback: anytype,
         completion: *Completion,
         comptime op_tag: std.meta.Tag(Completion.Operation),
-        op_data: anytype,
+        operation: Completion.Operation,
         comptime OperationImpl: type,
     ) void {
         const Callback = struct {
@@ -272,10 +274,10 @@ pub const IO = struct {
 
         // Setup the completion with the callback wrapper above
         completion.* = .{
-            .next = null,
+            .link = .{},
             .context = @ptrCast(context),
             .callback = Callback.onComplete,
-            .operation = @unionInit(Completion.Operation, @tagName(op_tag), op_data),
+            .operation = operation,
         };
 
         // Submit the completion onto the right queue
@@ -285,8 +287,38 @@ pub const IO = struct {
         }
     }
 
+    /// Process pending completions (non-blocking)
+    pub fn run(self: *IO) !void {
+        try self.flush(.non_blocking);
+    }
+
     pub fn cancel_all(_: *IO) void {
         // TODO Cancel in-flight async IO and wait for all completions.
+    }
+
+    pub const TCPOptions = common.TCPOptions;
+
+    /// Creates a TCP socket with options
+    pub fn open_socket_tcp(self: *IO, family: u32, options: TCPOptions) !socket_t {
+        const fd = try self.open_socket(family, std.posix.SOCK.STREAM, std.posix.IPPROTO.TCP);
+        errdefer self.close_socket(fd);
+        try common.tcp_options(fd, options);
+        return fd;
+    }
+
+    /// Creates a UDP socket
+    pub fn open_socket_udp(self: *IO, family: u32) !socket_t {
+        return try self.open_socket(family, std.posix.SOCK.DGRAM, std.posix.IPPROTO.UDP);
+    }
+
+    /// Bind and listen on a TCP socket (synchronous)
+    pub fn listen(_: *IO, fd: socket_t, address: Address, options: common.ListenOptions) !Address {
+        return common.listen(fd, address, options);
+    }
+
+    /// Best-effort synchronous send (returns null if would block)
+    pub fn send_now(_: *IO, socket: socket_t, buffer: []const u8) ?usize {
+        return std.posix.send(socket, buffer, 0) catch return null;
     }
 
     pub const AcceptError = std.posix.AcceptError || std.posix.SetSockOptError;
@@ -308,12 +340,12 @@ pub const IO = struct {
             callback,
             completion,
             .accept,
-            .{
+            Completion.Operation{ .accept = .{
                 .overlapped = undefined,
                 .listen_socket = socket,
                 .client_socket = INVALID_SOCKET,
                 .addr_buffer = undefined,
-            },
+            } },
             struct {
                 fn do_operation(
                     ctx: Completion.Context,
@@ -433,12 +465,12 @@ pub const IO = struct {
             callback,
             completion,
             .connect,
-            .{
+            Completion.Operation{ .connect = .{
                 .socket = socket,
                 .address = address,
                 .overlapped = undefined,
                 .pending = false,
-            },
+            } },
             struct {
                 fn do_operation(ctx: Completion.Context, op: anytype) ConnectError!void {
                     var flags: os.windows.DWORD = undefined;
@@ -594,7 +626,7 @@ pub const IO = struct {
             callback,
             completion,
             .send,
-            transfer,
+            Completion.Operation{ .send = transfer },
             struct {
                 fn do_operation(ctx: Completion.Context, op: anytype) SendError!usize {
                     var flags: os.windows.DWORD = undefined;
@@ -697,7 +729,7 @@ pub const IO = struct {
             callback,
             completion,
             .recv,
-            transfer,
+            Completion.Operation{ .recv = transfer },
             struct {
                 fn do_operation(ctx: Completion.Context, op: anytype) RecvError!usize {
                     var flags: os.windows.DWORD = 0; // used both as input and output
@@ -804,12 +836,12 @@ pub const IO = struct {
             callback,
             completion,
             .read,
-            .{
+            Completion.Operation{ .read = .{
                 .fd = fd,
                 .buf = buffer.ptr,
                 .len = @as(u32, @intCast(buffer_limit(buffer.len))),
                 .offset = offset,
-            },
+            } },
             struct {
                 fn do_operation(ctx: Completion.Context, op: anytype) ReadError!usize {
                     // Do a synchronous read for now.
@@ -852,12 +884,12 @@ pub const IO = struct {
             callback,
             completion,
             .write,
-            .{
+            Completion.Operation{ .write = .{
                 .fd = fd,
                 .buf = buffer.ptr,
                 .len = @as(u32, @intCast(buffer_limit(buffer.len))),
                 .offset = offset,
-            },
+            } },
             struct {
                 fn do_operation(ctx: Completion.Context, op: anytype) WriteError!usize {
                     // Do a synchronous write for now.
@@ -885,7 +917,7 @@ pub const IO = struct {
             callback,
             completion,
             .close,
-            .{ .fd = fd },
+            Completion.Operation{ .close = .{ .fd = fd } },
             struct {
                 fn do_operation(ctx: Completion.Context, op: anytype) CloseError!void {
                     // Check if the fd is a SOCKET by seeing if getsockopt() returns ENOTSOCK
@@ -919,7 +951,7 @@ pub const IO = struct {
         // Special case a zero timeout as a yield.
         if (nanoseconds == 0) {
             completion.* = .{
-                .next = null,
+                .link = .{},
                 .context = @ptrCast(context),
                 .operation = undefined,
                 .callback = struct {
@@ -939,7 +971,7 @@ pub const IO = struct {
             callback,
             completion,
             .timeout,
-            .{ .deadline = self.timer.monotonic() + nanoseconds },
+            Completion.Operation{ .timeout = .{ .deadline = self.timer.monotonic() + nanoseconds } },
             struct {
                 fn do_operation(ctx: Completion.Context, op: anytype) TimeoutError!void {
                     _ = ctx;
@@ -950,6 +982,7 @@ pub const IO = struct {
         );
     }
 
+    pub const socket_t = std.posix.socket_t;
     pub const INVALID_SOCKET = os.windows.ws2_32.INVALID_SOCKET;
 
     /// Creates a socket that can be used for async operations with the IO instance.

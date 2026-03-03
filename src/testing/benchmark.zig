@@ -26,7 +26,7 @@ const BenchmarkStats = struct {
         }
 
         // 分配排序数组
-        var sorted = std.testing.allocator.alloc(u64, times.len) catch unreachable;
+        const sorted = std.testing.allocator.alloc(u64, times.len) catch unreachable;
         defer std.testing.allocator.free(sorted);
         @memcpy(sorted, times);
         std.mem.sort(u64, sorted, {}, comptime std.sort.asc(u64));
