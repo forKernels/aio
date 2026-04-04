@@ -298,14 +298,14 @@ pub fn equal_bytes(comptime T: type, a: *const T, b: *const T) bool {
 
 fn has_pointers(comptime T: type) bool {
     switch (@typeInfo(T)) {
-        .Pointer => return true,
+        .pointer => return true,
         // Be conservative.
         else => return true,
 
-        .Bool, .Int, .Enum => return false,
+        .bool, .int, .@"enum" => return false,
 
-        .Array => |info| return comptime has_pointers(info.child),
-        .Struct => |info| {
+        .array => |info| return comptime has_pointers(info.child),
+        .@"struct" => |info| {
             inline for (info.fields) |field| {
                 if (comptime has_pointers(field.type)) return true;
             }
@@ -396,7 +396,7 @@ pub inline fn hash_inline(value: anytype) u64 {
         assert(has_unique_representation(@TypeOf(value)));
     }
     return low_level_hash(0, switch (@typeInfo(@TypeOf(value))) {
-        .Struct, .Int => std.mem.asBytes(&value),
+        .@"struct", .int => std.mem.asBytes(&value),
         else => @compileError("unsupported hashing for " ++ @typeName(@TypeOf(value))),
     });
 }
@@ -472,7 +472,7 @@ inline fn low_level_hash(seed: u64, input: anytype) u64 {
 /// updates explicitly in production code.
 pub fn update(base: anytype, diff: anytype) @TypeOf(base) {
     assert(builtin.is_test);
-    assert(@typeInfo(@TypeOf(base)) == .Struct);
+    assert(@typeInfo(@TypeOf(base)) == .@"struct");
 
     var updated = base;
     inline for (std.meta.fields(@TypeOf(diff))) |f| {
@@ -750,7 +750,7 @@ pub fn EnumUnionType(
         }};
     }
 
-    return @Type(.{ .Union = .{
+    return @Type(.{ .@"union" = .{
         .layout = .auto,
         .fields = fields,
         .decls = &.{},
@@ -823,7 +823,7 @@ pub fn array_print(
     args: anytype,
 ) []const u8 {
     const Args = @TypeOf(args);
-    const ArgsStruct = @typeInfo(Args).Struct;
+    const ArgsStruct = @typeInfo(Args).@"struct";
     comptime assert(ArgsStruct.is_tuple);
 
     comptime {

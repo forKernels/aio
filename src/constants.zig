@@ -27,7 +27,7 @@ pub const log = std.log.defaultLog;
 /// A log function that discards all log entries.
 pub fn log_nop(
     comptime message_level: std.log.Level,
-    comptime scope: @Type(.EnumLiteral),
+    comptime scope: @Type(.enum_literal),
     comptime format: []const u8,
     args: anytype,
 ) void {
@@ -89,3 +89,6 @@ pub const lsm_compaction_iops_write_max = lsm_compaction_queue_write_max + 1; //
 /// only during unit tests of the data structure.
 // pub const verify = config.process.verify;
 pub const verify = true;
+
+/// Default tick duration in milliseconds (used by IO event loop).
+pub const tick_ms: u63 = 10;
