@@ -2,7 +2,16 @@ const std = @import("std");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
-    const optimize = b.standardOptimizeOption(.{});
+    // ReleaseFast (org optimize policy): no Fortran under this layer, so the compute
+    // IS the Zig and safety checks sit on the hot path rather than off it.
+    //
+    // NOT a bare standardOptimizeOption(.{}): that defaults to Debug, which
+    // materializes `undefined` as real bytes and once shipped a 68MB archive.
+    const optimize = b.option(
+        std.builtin.OptimizeMode,
+        "optimize",
+        "Prioritize performance, safety, or binary size (delivery default: ReleaseFast)",
+    ) orelse .ReleaseFast;
 
     const module = b.addModule("aio", .{
         .root_source_file = b.path("src/aio.zig"),
