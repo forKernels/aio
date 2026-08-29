@@ -4,7 +4,10 @@ const assert = std.debug.assert;
 const log = std.log.scoped(.io);
 const constants = @import("../constants.zig");
 const common = @import("./common.zig");
-const Address = std.net.Address;
+// 0.16 moved networking from std.net to std.Io.net, where the address type is
+// IpAddress rather than Address.
+const zig16 = @import("builtin").zig_version.order(.{ .major = 0, .minor = 16, .patch = 0 }) != .lt;
+const Address = if (zig16) std.Io.net.IpAddress else std.net.Address;
 
 const queue_mod = @import("../queue.zig");
 const QueueType = queue_mod.QueueType;
