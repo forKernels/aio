@@ -13,11 +13,26 @@ pub fn build(b: *std.Build) void {
         "Prioritize performance, safety, or binary size (delivery default: ReleaseFast)",
     ) orelse .ReleaseFast;
 
+    // Reflective type construction, selected BY COMPILER VERSION.
+    //
+    // 0.16 removed @Type in favour of @Union/@Enum/@Struct. That cannot be
+    // handled with a comptime branch the way a moved namespace member can:
+    // "invalid builtin function" comes from AstGen, which walks the whole file
+    // before any branch is evaluated, so a dead branch still fails. The wrong
+    // file therefore must never be reached -- hence picking it here.
+    const zig16 = @import("builtin").zig_version.order(.{ .major = 0, .minor = 16, .patch = 0 }) != .lt;
+    const reify_module = b.addModule("reify", .{
+        .root_source_file = b.path(if (zig16) "src/reify_016.zig" else "src/reify_pre016.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const module = b.addModule("aio", .{
         .root_source_file = b.path("src/aio.zig"),
         .target = target,
         .optimize = optimize,
     });
+    module.addImport("reify", reify_module);
 
     const unit_tests = b.addTest(.{
         .root_module = module,

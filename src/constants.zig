@@ -7,6 +7,7 @@ const assert = std.debug.assert;
 // const vsr = @import("vsr.zig");
 // const Config = @import("config.zig").Config;
 const stdx = @import("stdx.zig");
+const reify = @import("reify");
 
 // pub const config = @import("config.zig").configs.current;
 
@@ -27,7 +28,7 @@ pub const log = std.log.defaultLog;
 /// A log function that discards all log entries.
 pub fn log_nop(
     comptime message_level: std.log.Level,
-    comptime scope: @Type(.enum_literal),
+    comptime scope: reify.EnumLiteral,
     comptime format: []const u8,
     args: anytype,
 ) void {

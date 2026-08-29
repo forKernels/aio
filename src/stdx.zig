@@ -1,6 +1,10 @@
 //! Extensions to the standard library -- things which could have been in std, but aren't.
 
 const std = @import("std");
+// Reflective type construction. 0.16 removed @Type; build.zig selects the
+// version-appropriate implementation, because an unknown BUILTIN is an AstGen
+// error and a comptime branch cannot hide it.
+const reify = @import("reify");
 const builtin = @import("builtin");
 const assert = std.debug.assert;
 
@@ -253,7 +257,7 @@ pub const log = if (builtin.is_test)
     // Downgrade `err` to `warn` for tests.
     // Zig fails any test that does `log.err`, but we want to test those code paths here.
     struct {
-        pub fn scoped(comptime scope: @Type(.enum_literal)) type {
+        pub fn scoped(comptime scope: reify.EnumLiteral) type {
             const base = std.log.scoped(scope);
             return struct {
                 pub const err = warn;
@@ -750,12 +754,7 @@ pub fn EnumUnionType(
         }};
     }
 
-    return @Type(.{ .@"union" = .{
-        .layout = .auto,
-        .fields = fields,
-        .decls = &.{},
-        .tag_type = Enum,
-    } });
+    return reify.Union(Enum, fields);
 }
 
 /// Creates a slice to a comptime slice without triggering
