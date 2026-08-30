@@ -1,4 +1,29 @@
 const std = @import("std");
+// 0.16 dropped QueryPerformanceCounter/Frequency from std.os.windows; they are
+// plain kernel32 entry points.
+const zig16_time = @import("builtin").zig_version.order(.{ .major = 0, .minor = 16, .patch = 0 }) != .lt;
+extern "kernel32" fn QueryPerformanceCounter_(c: *i64) callconv(.winapi) i32;
+extern "kernel32" fn QueryPerformanceFrequency_(f: *i64) callconv(.winapi) i32;
+
+fn qpcNow() u64 {
+    if (!zig16_time) {
+        return qpcNow();
+    } else {
+        var c: i64 = 0;
+        _ = QueryPerformanceCounter_(&c);
+        return @intCast(c);
+    }
+}
+
+fn qpfNow() u64 {
+    if (!zig16_time) {
+        return qpfNow();
+    } else {
+        var f: i64 = 0;
+        _ = QueryPerformanceFrequency_(&f);
+        return @intCast(f);
+    }
+}
 const builtin = @import("builtin");
 
 const stdx = @import("./stdx.zig");
@@ -53,8 +78,8 @@ pub const Time = struct {
         //
         // https://docs.microsoft.com/en-us/windows-hardware/drivers/ddi/ntddk/ns-ntddk-kuser_shared_data
         // https://www.geoffchappell.com/studies/windows/km/ntoskrnl/inc/api/ntexapi_x/kuser_shared_data/index.htm
-        const qpc = os.windows.QueryPerformanceCounter();
-        const qpf = os.windows.QueryPerformanceFrequency();
+        const qpc = qpcNow();
+        const qpf = qpfNow();
 
         // 10Mhz (1 qpc tick every 100ns) is a common QPF on modern systems.
         // We can optimize towards this by converting to ns via a single multiply.

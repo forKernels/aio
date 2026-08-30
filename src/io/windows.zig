@@ -4,6 +4,7 @@ const assert = std.debug.assert;
 const log = std.log.scoped(.io);
 const constants = @import("../constants.zig");
 const common = @import("./common.zig");
+const wincompat = @import("./wincompat.zig");
 // 0.16 moved networking from std.net to std.Io.net, where the address type is
 // IpAddress rather than Address.
 const zig16 = @import("builtin").zig_version.order(.{ .major = 0, .minor = 16, .patch = 0 }) != .lt;
@@ -16,7 +17,7 @@ const buffer_limit = @import("../io.zig").buffer_limit;
 const DirectIO = @import("../io.zig").DirectIO;
 
 pub const IO = struct {
-    iocp: os.windows.HANDLE,
+    iocp: wincompat.HANDLE,
     timer: Time = .{},
     io_pending: usize = 0,
     timeouts: QueueType(Completion) = QueueType(Completion).init(.{ .name = "io_timeouts" }),
@@ -26,11 +27,11 @@ pub const IO = struct {
         _ = entries;
         _ = flags;
 
-        _ = try os.windows.WSAStartup(2, 2);
-        errdefer os.windows.WSACleanup() catch unreachable;
+        _ = try wincompat.WSAStartup(2, 2);
+        errdefer wincompat.WSACleanup() catch unreachable;
 
-        const iocp = try os.windows.CreateIoCompletionPort(
-            os.windows.INVALID_HANDLE_VALUE,
+        const iocp = try wincompat.CreateIoCompletionPort(
+            wincompat.INVALID_HANDLE_VALUE,
             null,
             0,
             0,
@@ -39,11 +40,11 @@ pub const IO = struct {
     }
 
     pub fn deinit(self: *IO) void {
-        assert(self.iocp != os.windows.INVALID_HANDLE_VALUE);
-        os.windows.CloseHandle(self.iocp);
-        self.iocp = os.windows.INVALID_HANDLE_VALUE;
+        assert(self.iocp != wincompat.INVALID_HANDLE_VALUE);
+        wincompat.CloseHandle(self.iocp);
+        self.iocp = wincompat.INVALID_HANDLE_VALUE;
 
-        os.windows.WSACleanup() catch unreachable;
+        wincompat.WSACleanup() catch unreachable;
     }
 
     pub fn tick(self: *IO) !void {
@@ -81,17 +82,17 @@ pub const IO = struct {
         if (self.completed.empty()) {
             // Compute how long to poll by flushing timeout completions.
             // NOTE: this may push to completed queue
-            var timeout_ms: ?os.windows.DWORD = null;
+            var timeout_ms: ?wincompat.DWORD = null;
             if (self.flush_timeouts()) |expires_ns| {
                 // 0ns expires should have been completed not returned
                 assert(expires_ns != 0);
                 // Round up sub-millisecond expire times to the next millisecond
                 const expires_ms = (expires_ns + (std.time.ns_per_ms / 2)) / std.time.ns_per_ms;
                 // Saturating cast to DWORD milliseconds
-                const expires = std.math.cast(os.windows.DWORD, expires_ms) orelse
-                    std.math.maxInt(os.windows.DWORD);
+                const expires = std.math.cast(wincompat.DWORD, expires_ms) orelse
+                    std.math.maxInt(wincompat.DWORD);
                 // max DWORD is reserved for INFINITE so cap the cast at max - 1
-                timeout_ms = if (expires == os.windows.INFINITE) expires - 1 else expires;
+                timeout_ms = if (expires == wincompat.INFINITE) expires - 1 else expires;
             }
 
             // Poll for IO iff there's IO pending and flush_timeouts() found no ready completions
@@ -103,8 +104,8 @@ pub const IO = struct {
                     .non_blocking => 0,
                 };
 
-                var events: [64]os.windows.OVERLAPPED_ENTRY = undefined;
-                const num_events: u32 = os.windows.GetQueuedCompletionStatusEx(
+                var events: [64]wincompat.OVERLAPPED_ENTRY = undefined;
+                const num_events: u32 = wincompat.GetQueuedCompletionStatusEx(
                     self.iocp,
                     &events,
                     io_timeout,
@@ -190,13 +191,13 @@ pub const IO = struct {
         };
 
         const Overlapped = struct {
-            raw: os.windows.OVERLAPPED,
+            raw: wincompat.OVERLAPPED,
             completion: *Completion,
         };
 
         const Transfer = struct {
             socket: std.posix.socket_t,
-            buf: os.windows.ws2_32.WSABUF,
+            buf: wincompat.WSABUF,
             overlapped: Overlapped,
             pending: bool,
         };
@@ -324,7 +325,7 @@ pub const IO = struct {
         return std.posix.send(socket, buffer, 0) catch return null;
     }
 
-    pub const AcceptError = std.posix.AcceptError || std.posix.SetSockOptError;
+    pub const AcceptError = wincompat.AcceptError || wincompat.SetSockOptError;
 
     pub fn accept(
         self: *IO,
@@ -354,8 +355,8 @@ pub const IO = struct {
                     ctx: Completion.Context,
                     op: anytype,
                 ) AcceptError!std.posix.socket_t {
-                    var flags: os.windows.DWORD = undefined;
-                    var transferred: os.windows.DWORD = undefined;
+                    var flags: wincompat.DWORD = undefined;
+                    var transferred: wincompat.DWORD = undefined;
 
                     const rc = switch (op.client_socket) {
                         // When first called, the client_socket is invalid so we start the op.
@@ -371,9 +372,9 @@ pub const IO = struct {
                                 else => |e| return e,
                             };
 
-                            var sync_bytes_read: os.windows.DWORD = undefined;
+                            var sync_bytes_read: wincompat.DWORD = undefined;
                             op.overlapped = .{
-                                .raw = std.mem.zeroes(os.windows.OVERLAPPED),
+                                .raw = std.mem.zeroes(wincompat.OVERLAPPED),
                                 .completion = ctx.completion,
                             };
 
@@ -390,19 +391,19 @@ pub const IO = struct {
                             );
                         },
                         // Called after accept was started, so get the result
-                        else => os.windows.ws2_32.WSAGetOverlappedResult(
+                        else => wincompat.WSAGetOverlappedResult(
                             op.listen_socket,
                             &op.overlapped.raw,
                             &transferred,
-                            os.windows.FALSE, // dont wait
+                            wincompat.FALSE, // dont wait
                             &flags,
                         ),
                     };
 
                     // return the socket if we succeed in accepting.
-                    if (rc != os.windows.FALSE) {
+                    if (rc != wincompat.FALSE) {
                         // enables getsockopt, setsockopt, getsockname, getpeername
-                        _ = os.windows.ws2_32.setsockopt(
+                        _ = wincompat.setsockopt(
                             op.client_socket,
                             os.windows.ws2_32.SOL.SOCKET,
                             os.windows.ws2_32.SO.UPDATE_ACCEPT_CONTEXT,
@@ -422,7 +423,7 @@ pub const IO = struct {
                         },
                     };
 
-                    return switch (os.windows.ws2_32.WSAGetLastError()) {
+                    return switch (wincompat.WSAGetLastError()) {
                         .WSA_IO_PENDING, .WSAEWOULDBLOCK, .WSA_IO_INCOMPLETE => error.WouldBlock,
                         .WSANOTINITIALISED => unreachable, // WSAStartup() was called
                         .WSAENETDOWN => unreachable, // WinSock error
@@ -476,17 +477,17 @@ pub const IO = struct {
             } },
             struct {
                 fn do_operation(ctx: Completion.Context, op: anytype) ConnectError!void {
-                    var flags: os.windows.DWORD = undefined;
-                    var transferred: os.windows.DWORD = undefined;
+                    var flags: wincompat.DWORD = undefined;
+                    var transferred: wincompat.DWORD = undefined;
 
                     const rc = blk: {
                         // Poll for the result if we've already started the connect op.
                         if (op.pending) {
-                            break :blk os.windows.ws2_32.WSAGetOverlappedResult(
+                            break :blk wincompat.WSAGetOverlappedResult(
                                 op.socket,
                                 &op.overlapped.raw,
                                 &transferred,
-                                os.windows.FALSE, // dont wait
+                                wincompat.FALSE, // dont wait
                                 &flags,
                             );
                         }
@@ -510,34 +511,34 @@ pub const IO = struct {
                         };
 
                         const LPFN_CONNECTEX = *const fn (
-                            Socket: os.windows.ws2_32.SOCKET,
-                            SockAddr: *const os.windows.ws2_32.sockaddr,
+                            Socket: wincompat.SOCKET,
+                            SockAddr: *const wincompat.sockaddr,
                             SockLen: std.posix.socklen_t,
                             SendBuf: ?*const anyopaque,
-                            SendBufLen: os.windows.DWORD,
-                            BytesSent: *os.windows.DWORD,
-                            Overlapped: *os.windows.OVERLAPPED,
-                        ) callconv(os.windows.WINAPI) os.windows.BOOL;
+                            SendBufLen: wincompat.DWORD,
+                            BytesSent: *wincompat.DWORD,
+                            Overlapped: *wincompat.OVERLAPPED,
+                        ) callconv(os.windows.WINAPI) wincompat.BOOL;
 
                         // Find the ConnectEx function by dynamically looking it up on the socket.
                         // TODO: use `os.windows.loadWinsockExtensionFunction` once the function
                         //       pointer is no longer required to be comptime.
                         var connect_ex: LPFN_CONNECTEX = undefined;
-                        var num_bytes: os.windows.DWORD = undefined;
-                        const guid = os.windows.ws2_32.WSAID_CONNECTEX;
-                        const socket_error = os.windows.ws2_32.SOCKET_ERROR;
-                        switch (os.windows.ws2_32.WSAIoctl(
+                        var num_bytes: wincompat.DWORD = undefined;
+                        const guid = wincompat.WSAID_CONNECTEX;
+                        const socket_error = wincompat.SOCKET_ERROR;
+                        switch (wincompat.WSAIoctl(
                             op.socket,
-                            os.windows.ws2_32.SIO_GET_EXTENSION_FUNCTION_POINTER,
+                            wincompat.SIO_GET_EXTENSION_FUNCTION_POINTER,
                             @ptrCast(&guid),
-                            @sizeOf(os.windows.GUID),
+                            @sizeOf(wincompat.GUID),
                             @ptrCast(&connect_ex),
                             @sizeOf(LPFN_CONNECTEX),
                             &num_bytes,
                             null,
                             null,
                         )) {
-                            socket_error => switch (os.windows.ws2_32.WSAGetLastError()) {
+                            socket_error => switch (wincompat.WSAGetLastError()) {
                                 .WSAEOPNOTSUPP => unreachable,
                                 .WSAENOTSOCK => unreachable,
                                 else => |err| return os.windows.unexpectedWSAError(err),
@@ -547,7 +548,7 @@ pub const IO = struct {
 
                         op.pending = true;
                         op.overlapped = .{
-                            .raw = std.mem.zeroes(os.windows.OVERLAPPED),
+                            .raw = std.mem.zeroes(wincompat.OVERLAPPED),
                             .completion = ctx.completion,
                         };
 
@@ -564,9 +565,9 @@ pub const IO = struct {
                     };
 
                     // return if we succeeded in connecting
-                    if (rc != os.windows.FALSE) {
+                    if (rc != wincompat.FALSE) {
                         // enables getsockopt, setsockopt, getsockname, getpeername
-                        _ = os.windows.ws2_32.setsockopt(
+                        _ = wincompat.setsockopt(
                             op.socket,
                             os.windows.ws2_32.SOL.SOCKET,
                             os.windows.ws2_32.SO.UPDATE_CONNECT_CONTEXT,
@@ -577,7 +578,7 @@ pub const IO = struct {
                         return;
                     }
 
-                    return switch (os.windows.ws2_32.WSAGetLastError()) {
+                    return switch (wincompat.WSAGetLastError()) {
                         .WSA_IO_PENDING, .WSAEWOULDBLOCK, .WSA_IO_INCOMPLETE => error.WouldBlock,
                         .WSAEALREADY => error.WouldBlock,
                         .WSANOTINITIALISED => unreachable, // WSAStartup() was called
@@ -616,7 +617,7 @@ pub const IO = struct {
     ) void {
         const transfer = Completion.Transfer{
             .socket = socket,
-            .buf = os.windows.ws2_32.WSABUF{
+            .buf = wincompat.WSABUF{
                 .len = @intCast(buffer_limit(buffer.len)),
                 .buf = @constCast(buffer.ptr),
             },
@@ -632,29 +633,29 @@ pub const IO = struct {
             Completion.Operation{ .send = transfer },
             struct {
                 fn do_operation(ctx: Completion.Context, op: anytype) SendError!usize {
-                    var flags: os.windows.DWORD = undefined;
-                    var transferred: os.windows.DWORD = undefined;
+                    var flags: wincompat.DWORD = undefined;
+                    var transferred: wincompat.DWORD = undefined;
 
                     const rc = blk: {
                         // Poll for the result if we've already started the send op.
                         if (op.pending) {
-                            break :blk os.windows.ws2_32.WSAGetOverlappedResult(
+                            break :blk wincompat.WSAGetOverlappedResult(
                                 op.socket,
                                 &op.overlapped.raw,
                                 &transferred,
-                                os.windows.FALSE, // dont wait
+                                wincompat.FALSE, // dont wait
                                 &flags,
                             );
                         }
 
                         op.pending = true;
                         op.overlapped = .{
-                            .raw = std.mem.zeroes(os.windows.OVERLAPPED),
+                            .raw = std.mem.zeroes(wincompat.OVERLAPPED),
                             .completion = ctx.completion,
                         };
 
                         // Start the send operation.
-                        break :blk switch (os.windows.ws2_32.WSASend(
+                        break :blk switch (wincompat.WSASend(
                             op.socket,
                             @ptrCast(&op.buf),
                             1, // one buffer
@@ -663,20 +664,20 @@ pub const IO = struct {
                             &op.overlapped.raw,
                             null,
                         )) {
-                            os.windows.ws2_32.SOCKET_ERROR => @as(
-                                os.windows.BOOL,
-                                os.windows.FALSE,
+                            wincompat.SOCKET_ERROR => @as(
+                                wincompat.BOOL,
+                                wincompat.FALSE,
                             ),
-                            0 => os.windows.TRUE,
+                            0 => wincompat.TRUE,
                             else => unreachable,
                         };
                     };
 
                     // Return bytes transferred on success.
-                    if (rc != os.windows.FALSE)
+                    if (rc != wincompat.FALSE)
                         return transferred;
 
-                    return switch (os.windows.ws2_32.WSAGetLastError()) {
+                    return switch (wincompat.WSAGetLastError()) {
                         .WSA_IO_PENDING, .WSAEWOULDBLOCK, .WSA_IO_INCOMPLETE => error.WouldBlock,
                         .WSANOTINITIALISED => unreachable, // WSAStartup() was called
                         .WSA_INVALID_HANDLE => unreachable, // we dont use OVERLAPPED.hEvent
@@ -719,7 +720,7 @@ pub const IO = struct {
     ) void {
         const transfer = Completion.Transfer{
             .socket = socket,
-            .buf = os.windows.ws2_32.WSABUF{
+            .buf = wincompat.WSABUF{
                 .len = @intCast(buffer_limit(buffer.len)),
                 .buf = buffer.ptr,
             },
@@ -735,29 +736,29 @@ pub const IO = struct {
             Completion.Operation{ .recv = transfer },
             struct {
                 fn do_operation(ctx: Completion.Context, op: anytype) RecvError!usize {
-                    var flags: os.windows.DWORD = 0; // used both as input and output
-                    var transferred: os.windows.DWORD = undefined;
+                    var flags: wincompat.DWORD = 0; // used both as input and output
+                    var transferred: wincompat.DWORD = undefined;
 
                     const rc = blk: {
                         // Poll for the result if we've already started the recv op.
                         if (op.pending) {
-                            break :blk os.windows.ws2_32.WSAGetOverlappedResult(
+                            break :blk wincompat.WSAGetOverlappedResult(
                                 op.socket,
                                 &op.overlapped.raw,
                                 &transferred,
-                                os.windows.FALSE, // dont wait
+                                wincompat.FALSE, // dont wait
                                 &flags,
                             );
                         }
 
                         op.pending = true;
                         op.overlapped = .{
-                            .raw = std.mem.zeroes(os.windows.OVERLAPPED),
+                            .raw = std.mem.zeroes(wincompat.OVERLAPPED),
                             .completion = ctx.completion,
                         };
 
                         // Start the recv operation.
-                        break :blk switch (os.windows.ws2_32.WSARecv(
+                        break :blk switch (wincompat.WSARecv(
                             op.socket,
                             @ptrCast(&op.buf),
                             1, // one buffer
@@ -766,20 +767,20 @@ pub const IO = struct {
                             &op.overlapped.raw,
                             null,
                         )) {
-                            os.windows.ws2_32.SOCKET_ERROR => @as(
-                                os.windows.BOOL,
-                                os.windows.FALSE,
+                            wincompat.SOCKET_ERROR => @as(
+                                wincompat.BOOL,
+                                wincompat.FALSE,
                             ),
-                            0 => os.windows.TRUE,
+                            0 => wincompat.TRUE,
                             else => unreachable,
                         };
                     };
 
                     // Return bytes received on success.
-                    if (rc != os.windows.FALSE)
+                    if (rc != wincompat.FALSE)
                         return transferred;
 
-                    return switch (os.windows.ws2_32.WSAGetLastError()) {
+                    return switch (wincompat.WSAGetLastError()) {
                         .WSA_IO_PENDING, .WSAEWOULDBLOCK, .WSA_IO_INCOMPLETE => error.WouldBlock,
                         .WSANOTINITIALISED => unreachable, // WSAStartup() was called
                         .WSA_INVALID_HANDLE => unreachable, // we dont use OVERLAPPED.hEvent
@@ -927,7 +928,7 @@ pub const IO = struct {
                     // https://stackoverflow.com/a/50981652
                     const socket: std.posix.socket_t = @ptrCast(op.fd);
                     getsockoptError(socket) catch |err| switch (err) {
-                        error.FileDescriptorNotASocket => return os.windows.CloseHandle(op.fd),
+                        error.FileDescriptorNotASocket => return wincompat.CloseHandle(op.fd),
                         else => {},
                     };
 
@@ -986,16 +987,16 @@ pub const IO = struct {
     }
 
     pub const socket_t = std.posix.socket_t;
-    pub const INVALID_SOCKET = os.windows.ws2_32.INVALID_SOCKET;
+    pub const INVALID_SOCKET = wincompat.INVALID_SOCKET;
 
     /// Creates a socket that can be used for async operations with the IO instance.
     pub fn open_socket(self: *IO, family: u32, sock_type: u32, protocol: u32) !std.posix.socket_t {
         // SOCK_NONBLOCK | SOCK_CLOEXEC
-        var flags: os.windows.DWORD = 0;
-        flags |= os.windows.ws2_32.WSA_FLAG_OVERLAPPED;
-        flags |= os.windows.ws2_32.WSA_FLAG_NO_HANDLE_INHERIT;
+        var flags: wincompat.DWORD = 0;
+        flags |= wincompat.WSA_FLAG_OVERLAPPED;
+        flags |= wincompat.WSA_FLAG_NO_HANDLE_INHERIT;
 
-        const socket = try os.windows.WSASocketW(
+        const socket = try wincompat.WSASocketW(
             @as(i32, @bitCast(family)),
             @bitCast(sock_type),
             @bitCast(protocol),
@@ -1005,17 +1006,17 @@ pub const IO = struct {
         );
         errdefer self.close_socket(socket);
 
-        const socket_iocp = try os.windows.CreateIoCompletionPort(socket, self.iocp, 0, 0);
+        const socket_iocp = try wincompat.CreateIoCompletionPort(socket, self.iocp, 0, 0);
         assert(socket_iocp == self.iocp);
 
         // Ensure that synchronous IO completion doesn't queue an unneeded overlapped
         // and that the event for the socket (WaitForSingleObject) doesn't need to be set.
-        var mode: os.windows.BYTE = 0;
-        mode |= os.windows.FILE_SKIP_COMPLETION_PORT_ON_SUCCESS;
-        mode |= os.windows.FILE_SKIP_SET_EVENT_ON_HANDLE;
+        var mode: wincompat.BYTE = 0;
+        mode |= wincompat.FILE_SKIP_COMPLETION_PORT_ON_SUCCESS;
+        mode |= wincompat.FILE_SKIP_SET_EVENT_ON_HANDLE;
 
-        const handle: os.windows.HANDLE = @ptrCast(socket);
-        try os.windows.SetFileCompletionNotificationModes(handle, mode);
+        const handle: wincompat.HANDLE = @ptrCast(socket);
+        try wincompat.SetFileCompletionNotificationModes(handle, mode);
 
         return socket;
     }
@@ -1023,7 +1024,7 @@ pub const IO = struct {
     /// Closes a socket opened by the IO instance.
     pub fn close_socket(self: *IO, socket: std.posix.socket_t) void {
         _ = self;
-        std.posix.close(socket);
+        wincompat.closeSocket(socket);
     }
 
     /// Opens a directory with read only access.
@@ -1033,7 +1034,7 @@ pub const IO = struct {
     }
 
     pub const fd_t = std.posix.fd_t;
-    pub const INVALID_FILE = os.windows.INVALID_HANDLE_VALUE;
+    pub const INVALID_FILE = wincompat.INVALID_HANDLE_VALUE;
 
     // TODO open_read_only should open the file as read-only.
     fn open_file_handle(
@@ -1044,43 +1045,43 @@ pub const IO = struct {
         const path_w = try os.windows.sliceToPrefixedFileW(dir_handle, relative_path);
 
         // FILE_CREATE = O_CREAT | O_EXCL
-        var creation_disposition: os.windows.DWORD = 0;
+        var creation_disposition: wincompat.DWORD = 0;
         switch (method) {
             .create => {
-                creation_disposition = os.windows.FILE_CREATE;
+                creation_disposition = wincompat.FILE_CREATE;
                 log.info("creating \"{s}\"...", .{relative_path});
             },
             .open, .open_read_only => {
-                creation_disposition = os.windows.OPEN_EXISTING;
+                creation_disposition = wincompat.OPEN_EXISTING;
                 log.info("opening \"{s}\"...", .{relative_path});
             },
         }
 
         // O_EXCL
-        const shared_mode: os.windows.DWORD = 0;
+        const shared_mode: wincompat.DWORD = 0;
 
         // O_RDWR
         // Zig's mask seems wonky; according to
         // https://learn.microsoft.com/en-us/windows/win32/api/winternl/nf-winternl-ntcreatefile
         // FILE_GENERIC_READ should include SYNCHRONIZE but it does not.
-        var access_mask: os.windows.DWORD = 0;
-        access_mask |= os.windows.SYNCHRONIZE;
+        var access_mask: wincompat.DWORD = 0;
+        access_mask |= wincompat.SYNCHRONIZE;
         access_mask |= os.windows.GENERIC_READ;
         access_mask |= os.windows.GENERIC_WRITE;
 
         // O_DIRECT | O_DSYNC
         // NB: These are NtDll flags, not to be confused with the Win32 style flags that are
         // similar but different (!).
-        var attributes: os.windows.DWORD = 0;
-        attributes |= os.windows.FILE_NO_INTERMEDIATE_BUFFERING;
-        attributes |= os.windows.FILE_WRITE_THROUGH;
+        var attributes: wincompat.DWORD = 0;
+        attributes |= wincompat.FILE_NO_INTERMEDIATE_BUFFERING;
+        attributes |= wincompat.FILE_WRITE_THROUGH;
 
         // This is critical as we rely on O_DSYNC for fsync() whenever we write to the file:
-        assert((attributes & os.windows.FILE_WRITE_THROUGH) > 0);
+        assert((attributes & wincompat.FILE_WRITE_THROUGH) > 0);
 
         // TODO: Add ReadFileEx/WriteFileEx support.
         // Not currently needed for O_DIRECT disk IO.
-        // attributes |= os.windows.FILE_FLAG_OVERLAPPED;
+        // attributes |= wincompat.FILE_FLAG_OVERLAPPED;
         const handle = try windows_open_file(path_w.span(), .{
             .access_mask = access_mask,
             .dir = dir_handle,
@@ -1091,13 +1092,13 @@ pub const IO = struct {
             .follow_symlinks = true,
         }, attributes);
 
-        if (handle == os.windows.INVALID_HANDLE_VALUE) {
-            return switch (os.windows.kernel32.GetLastError()) {
+        if (handle == wincompat.INVALID_HANDLE_VALUE) {
+            return switch (wincompat.kernel32.GetLastError()) {
                 .FILE_NOT_FOUND => error.FileNotFound,
                 .SHARING_VIOLATION, .ACCESS_DENIED => error.AccessDenied,
                 else => |err| {
                     log.warn("CreateFileW(): {}", .{err});
-                    return os.windows.unexpectedError(err);
+                    return wincompat.unexpectedError(err);
                 },
             };
         }
@@ -1138,7 +1139,7 @@ pub const IO = struct {
                 else => return err,
             },
         };
-        errdefer os.windows.CloseHandle(handle);
+        errdefer wincompat.CloseHandle(handle);
 
         // Obtain an advisory exclusive lock
         // even when we haven't given shared access to other processes.
@@ -1182,7 +1183,7 @@ pub const IO = struct {
         //
         // try std.posix.fsync(dir_handle);
 
-        const file_size = try os.windows.GetFileSizeEx(handle);
+        const file_size = try wincompat.GetFileSizeEx(handle);
         if (file_size < size) @panic("data file inode size was truncated or corrupted");
 
         return handle;
@@ -1200,13 +1201,13 @@ pub const IO = struct {
             // by convention, used for building generic types.
             const lock_file_ex = @extern(
                 *const fn (
-                    hFile: os.windows.HANDLE,
-                    dwFlags: os.windows.DWORD,
-                    dwReserved: os.windows.DWORD,
-                    nNumberOfBytesToLockLow: os.windows.DWORD,
-                    nNumberOfBytesToLockHigh: os.windows.DWORD,
-                    lpOverlapped: ?*os.windows.OVERLAPPED,
-                ) callconv(os.windows.WINAPI) os.windows.BOOL,
+                    hFile: wincompat.HANDLE,
+                    dwFlags: wincompat.DWORD,
+                    dwReserved: wincompat.DWORD,
+                    nNumberOfBytesToLockLow: wincompat.DWORD,
+                    nNumberOfBytesToLockHigh: wincompat.DWORD,
+                    lpOverlapped: ?*wincompat.OVERLAPPED,
+                ) callconv(os.windows.WINAPI) wincompat.BOOL,
                 .{
                     .library_name = "kernel32",
                     .name = "LockFileEx",
@@ -1215,10 +1216,10 @@ pub const IO = struct {
         };
         // hEvent = null
         // Offset & OffsetHigh = 0
-        var lock_overlapped = std.mem.zeroes(os.windows.OVERLAPPED);
+        var lock_overlapped = std.mem.zeroes(wincompat.OVERLAPPED);
 
         // LOCK_EX | LOCK_NB
-        var lock_flags: os.windows.DWORD = 0;
+        var lock_flags: wincompat.DWORD = 0;
         lock_flags |= kernel32.LOCKFILE_EXCLUSIVE_LOCK;
         lock_flags |= kernel32.LOCKFILE_FAIL_IMMEDIATELY;
 
@@ -1231,10 +1232,10 @@ pub const IO = struct {
             &lock_overlapped,
         );
 
-        if (locked == os.windows.FALSE) {
-            return switch (os.windows.kernel32.GetLastError()) {
+        if (locked == wincompat.FALSE) {
+            return switch (wincompat.kernel32.GetLastError()) {
                 .IO_PENDING => error.WouldBlock,
-                else => |err| os.windows.unexpectedError(err),
+                else => |err| wincompat.unexpectedError(err),
             };
         }
     }
@@ -1244,26 +1245,26 @@ pub const IO = struct {
         // NOTE: Requires SE_MANAGE_VOLUME_NAME privilege
 
         // Move the file pointer to the start + size
-        const seeked = os.windows.kernel32.SetFilePointerEx(
+        const seeked = wincompat.kernel32.SetFilePointerEx(
             handle,
             @intCast(size),
             null, // no reference to new file pointer
-            os.windows.FILE_BEGIN,
+            wincompat.FILE_BEGIN,
         );
 
-        if (seeked == os.windows.FALSE) {
-            return switch (os.windows.kernel32.GetLastError()) {
+        if (seeked == wincompat.FALSE) {
+            return switch (wincompat.kernel32.GetLastError()) {
                 .INVALID_HANDLE => unreachable,
                 .INVALID_PARAMETER => unreachable,
-                else => |err| os.windows.unexpectedError(err),
+                else => |err| wincompat.unexpectedError(err),
             };
         }
 
         // Mark the moved file pointer (start + size) as the physical EOF.
-        const allocated = os.windows.kernel32.SetEndOfFile(handle);
-        if (allocated == os.windows.FALSE) {
-            const err = os.windows.kernel32.GetLastError();
-            return os.windows.unexpectedError(err);
+        const allocated = wincompat.kernel32.SetEndOfFile(handle);
+        if (allocated == wincompat.FALSE) {
+            const err = wincompat.kernel32.GetLastError();
+            return wincompat.unexpectedError(err);
         }
     }
 };
@@ -1272,7 +1273,7 @@ pub const IO = struct {
 fn getsockoptError(socket: std.posix.socket_t) IO.ConnectError!void {
     var err_code: u32 = undefined;
     var size: i32 = @sizeOf(u32);
-    const rc = os.windows.ws2_32.getsockopt(
+    const rc = wincompat.getsockopt(
         socket,
         std.posix.SOL.SOCKET,
         std.posix.SO.ERROR,
@@ -1281,7 +1282,7 @@ fn getsockoptError(socket: std.posix.socket_t) IO.ConnectError!void {
     );
 
     if (rc != 0) {
-        switch (os.windows.ws2_32.WSAGetLastError()) {
+        switch (wincompat.WSAGetLastError()) {
             .WSAENETDOWN => return error.NetworkUnreachable,
             .WSANOTINITIALISED => unreachable, // WSAStartup() was never called
 
@@ -1325,8 +1326,8 @@ fn getsockoptError(socket: std.posix.socket_t) IO.ConnectError!void {
 pub fn windows_open_file(
     sub_path_w: []const u16,
     options: os.windows.OpenFileOptions,
-    file_flags: os.windows.ULONG,
-) os.windows.OpenError!os.windows.HANDLE {
+    file_flags: wincompat.ULONG,
+) os.windows.OpenError!wincompat.HANDLE {
     if (std.mem.eql(u16, sub_path_w, &[_]u16{'.'}) and options.filter == .file_only) {
         return error.IsDir;
     }
@@ -1334,44 +1335,44 @@ pub fn windows_open_file(
         return error.IsDir;
     }
 
-    var result: os.windows.HANDLE = undefined;
+    var result: wincompat.HANDLE = undefined;
 
     const path_len_bytes = std.math.cast(u16, sub_path_w.len * 2) orelse return error.NameTooLong;
-    var nt_name = os.windows.UNICODE_STRING{
+    var nt_name = wincompat.UNICODE_STRING{
         .Length = path_len_bytes,
         .MaximumLength = path_len_bytes,
         .Buffer = @constCast(sub_path_w.ptr),
     };
-    var attr = os.windows.OBJECT_ATTRIBUTES{
-        .Length = @sizeOf(os.windows.OBJECT_ATTRIBUTES),
+    var attr = wincompat.OBJECT_ATTRIBUTES{
+        .Length = @sizeOf(wincompat.OBJECT_ATTRIBUTES),
         .RootDirectory = if (std.fs.path.isAbsoluteWindowsWTF16(sub_path_w)) null else options.dir,
         .Attributes = 0, // Note we do not use OBJ_CASE_INSENSITIVE here.
         .ObjectName = &nt_name,
         .SecurityDescriptor = if (options.sa) |ptr| ptr.lpSecurityDescriptor else null,
         .SecurityQualityOfService = null,
     };
-    var io: os.windows.IO_STATUS_BLOCK = undefined;
-    const blocking_flag: os.windows.ULONG = os.windows.FILE_SYNCHRONOUS_IO_NONALERT;
-    const file_or_dir_flag: os.windows.ULONG = switch (options.filter) {
-        .file_only => os.windows.FILE_NON_DIRECTORY_FILE,
-        .dir_only => os.windows.FILE_DIRECTORY_FILE,
+    var io: wincompat.IO_STATUS_BLOCK = undefined;
+    const blocking_flag: wincompat.ULONG = wincompat.FILE_SYNCHRONOUS_IO_NONALERT;
+    const file_or_dir_flag: wincompat.ULONG = switch (options.filter) {
+        .file_only => wincompat.FILE_NON_DIRECTORY_FILE,
+        .dir_only => wincompat.FILE_DIRECTORY_FILE,
         .any => 0,
     };
     // If we're not following symlinks, we need to ensure we don't pass in any synchronization
     // flags such as FILE_SYNCHRONOUS_IO_NONALERT.
-    const flags: os.windows.ULONG = if (options.follow_symlinks)
+    const flags: wincompat.ULONG = if (options.follow_symlinks)
         file_or_dir_flag | blocking_flag
     else
-        file_or_dir_flag | os.windows.FILE_OPEN_REPARSE_POINT;
+        file_or_dir_flag | wincompat.FILE_OPEN_REPARSE_POINT;
 
     while (true) {
-        const rc = os.windows.ntdll.NtCreateFile(
+        const rc = wincompat.ntdll.NtCreateFile(
             &result,
             options.access_mask,
             &attr,
             &io,
             null,
-            os.windows.FILE_ATTRIBUTE_NORMAL,
+            wincompat.FILE_ATTRIBUTE_NORMAL,
             options.share_access,
             options.creation,
             flags | file_flags,
@@ -1407,7 +1408,7 @@ pub fn windows_open_file(
                 std.time.sleep(std.time.ns_per_ms);
                 continue;
             },
-            else => return os.windows.unexpectedStatus(rc),
+            else => return wincompat.unexpectedStatus(rc),
         }
     }
 }
