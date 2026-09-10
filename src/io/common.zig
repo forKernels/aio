@@ -7,7 +7,7 @@ const assert = std.debug.assert;
 
 const is_linux = builtin.target.os.tag == .linux;
 
-pub const Address = std.net.Address;
+pub const Address = @import("../zigcompat.zig").Address;
 
 pub const TCPOptions = struct {
     rcvbuf: c_int,
@@ -36,7 +36,7 @@ pub fn listen(
     // Resolve port 0 to an actual port picked by the OS.
     var address_resolved: Address = undefined;
     var addrlen: posix.socklen_t = @sizeOf(Address);
-    try posix.getsockname(fd, &address_resolved.any, &addrlen);
+    try @import("../zigcompat.zig").getSockName(fd, &address_resolved.any, &addrlen);
     assert(address_resolved.getOsSockLen() == addrlen);
     assert(address_resolved.any.family == address.any.family);
 

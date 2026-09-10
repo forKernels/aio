@@ -124,3 +124,19 @@ pub fn clockRealtime() std.os.linux.timespec {
         return ts;
     }
 }
+
+/// Local address of a bound socket. 0.16 moved getsockname to the raw syscall
+/// layer with an out-param and a usize return.
+pub fn getSockName(fd: i32, addr: *std.posix.sockaddr, len: *std.posix.socklen_t) !void {
+    if (!zig16) return std.posix.getsockname(fd, addr, len);
+    var ulen: u32 = @intCast(len.*);
+    if (linuxErr(std.os.linux.getsockname(fd, addr, &ulen))) return error.GetSockNameFailed;
+    len.* = @intCast(ulen);
+}
+
+/// std RENAMED this inside its own error set: 0.15.2 spells it
+/// FileLocksNotSupported, 0.16 FileLocksUnsupported. It surfaces as an error
+/// SET MISMATCH rather than an unknown name, which reads like a much larger
+/// problem than a rename. Shimmable where the @Type builtins were not, because
+/// an error literal always exists — `error.Whatever` defines it on the spot.
+pub const file_locks_err = if (zig16) error.FileLocksUnsupported else error.FileLocksNotSupported;
