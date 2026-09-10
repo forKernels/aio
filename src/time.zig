@@ -1,29 +1,4 @@
 const std = @import("std");
-// 0.16 dropped QueryPerformanceCounter/Frequency from std.os.windows; they are
-// plain kernel32 entry points.
-const zig16_time = @import("builtin").zig_version.order(.{ .major = 0, .minor = 16, .patch = 0 }) != .lt;
-extern "kernel32" fn QueryPerformanceCounter_(c: *i64) callconv(.winapi) i32;
-extern "kernel32" fn QueryPerformanceFrequency_(f: *i64) callconv(.winapi) i32;
-
-fn qpcNow() u64 {
-    if (!zig16_time) {
-        return qpcNow();
-    } else {
-        var c: i64 = 0;
-        _ = QueryPerformanceCounter_(&c);
-        return @intCast(c);
-    }
-}
-
-fn qpfNow() u64 {
-    if (!zig16_time) {
-        return qpfNow();
-    } else {
-        var f: i64 = 0;
-        _ = QueryPerformanceFrequency_(&f);
-        return @intCast(f);
-    }
-}
 const builtin = @import("builtin");
 
 const stdx = @import("./stdx.zig");
@@ -78,8 +53,8 @@ pub const Time = struct {
         //
         // https://docs.microsoft.com/en-us/windows-hardware/drivers/ddi/ntddk/ns-ntddk-kuser_shared_data
         // https://www.geoffchappell.com/studies/windows/km/ntoskrnl/inc/api/ntexapi_x/kuser_shared_data/index.htm
-        const qpc = qpcNow();
-        const qpf = qpfNow();
+        const qpc = os.windows.QueryPerformanceCounter();
+        const qpf = os.windows.QueryPerformanceFrequency();
 
         // 10Mhz (1 qpc tick every 100ns) is a common QPF on modern systems.
         // We can optimize towards this by converting to ns via a single multiply.
@@ -126,8 +101,7 @@ pub const Time = struct {
         //
         // For more detail and why CLOCK_MONOTONIC_RAW is even worse than CLOCK_MONOTONIC, see
         // https://github.com/ziglang/zig/pull/933#discussion_r656021295.
-        const ts = posix.clock_gettime(posix.CLOCK.BOOTTIME) catch @panic("CLOCK_BOOTTIME required");
-        return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+        return @import("zigcompat.zig").monotonicNanos();
     }
 
     /// A timestamp to measure real (i.e. wall clock) time, meaningful across systems, and reboots.
@@ -166,7 +140,7 @@ pub const Time = struct {
 
     fn realtime_unix() i64 {
         assert(is_darwin or is_linux);
-        const ts = posix.clock_gettime(posix.CLOCK.REALTIME) catch unreachable;
+        const ts = @import("zigcompat.zig").clockRealtime();
         return @as(i64, ts.sec) * std.time.ns_per_s + ts.nsec;
     }
 

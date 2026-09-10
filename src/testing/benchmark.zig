@@ -1,4 +1,5 @@
 const std = @import("std");
+const zigcompat = @import("../zigcompat.zig");
 const IO = @import("../aio.zig").IO;
 const Time = @import("../aio.zig").Time;
 
@@ -61,7 +62,7 @@ test "benchmark: IO.init/deinit performance" {
     // 参考 libuv 的 benchmark 实践：预热 + 多次测量 + 统计分析
     const warmup_iterations = 10;
     const iterations = 1000;
-    var timer = try std.time.Timer.start();
+    const t0 = zigcompat.monotonicNanos();
 
     // 预热：让 CPU 缓存和分支预测器预热
     warmup(1000);
@@ -77,10 +78,10 @@ test "benchmark: IO.init/deinit performance" {
     // 测量每次 init/deinit 循环的耗时
     // 在 Darwin 上，这主要涉及 kqueue() 系统调用和资源清理
     for (0..iterations) |i| {
-        const start = timer.read();
+        const start = (zigcompat.monotonicNanos() - t0);
         var io = try IO.init(32, 0);
         io.deinit();
-        times[i] = timer.read() - start;
+        times[i] = (zigcompat.monotonicNanos() - t0) - start;
     }
 
     const stats = BenchmarkStats.init(times);
@@ -98,7 +99,7 @@ test "benchmark: Time.monotonic() performance" {
     // libuv 级别的性能：应该 < 50ns 每次调用（在 Darwin 上使用 mach_continuous_time）
     const warmup_iterations = 1000;
     const iterations = 1_000_000; // 增加迭代次数以获得更精确的测量
-    var timer = try std.time.Timer.start();
+    const t0 = zigcompat.monotonicNanos();
     var time = Time{};
 
     // 预热：让 CPU 缓存和分支预测器预热
@@ -108,12 +109,12 @@ test "benchmark: Time.monotonic() performance" {
     }
 
     // 批量测量以减少计时器开销的影响
-    const start = timer.read();
+    const start = (zigcompat.monotonicNanos() - t0);
     var dummy: u64 = 0;
     for (0..iterations) |_| {
         dummy +%= time.monotonic();
     }
-    const elapsed = timer.read() - start;
+    const elapsed = (zigcompat.monotonicNanos() - t0) - start;
     // 使用 volatile 确保编译器不会优化掉这个循环
     @as(*volatile u64, @ptrCast(&dummy)).* = dummy;
 
@@ -138,15 +139,15 @@ test "benchmark: IO.run() overhead performance" {
         io.run() catch {};
     }
 
-    var timer = try std.time.Timer.start();
+    const t0 = zigcompat.monotonicNanos();
     var times = try std.testing.allocator.alloc(u64, iterations);
     defer std.testing.allocator.free(times);
 
     // 测量空循环的性能（无待处理的 IO 或超时）
     for (0..iterations) |i| {
-        const start = timer.read();
+        const start = (zigcompat.monotonicNanos() - t0);
         try io.run();
-        times[i] = timer.read() - start;
+        times[i] = (zigcompat.monotonicNanos() - t0) - start;
     }
 
     const stats = BenchmarkStats.init(times);
@@ -197,7 +198,7 @@ test "benchmark: IO.timeout() performance" {
         io.run() catch {};
     }
 
-    var timer = try std.time.Timer.start();
+    const t0 = zigcompat.monotonicNanos();
     var times = try std.testing.allocator.alloc(u64, iterations);
     defer std.testing.allocator.free(times);
 
@@ -207,10 +208,10 @@ test "benchmark: IO.timeout() performance" {
         var context = Context{ .called = &callback_called[i] };
         contexts[i] = &callback_called[i];
 
-        const start = timer.read();
+        const start = (zigcompat.monotonicNanos() - t0);
         io.timeout(*Context, &context, callback, &completions[i], 0); // Zero timeout = immediate
         try io.run(); // 处理超时
-        times[i] = timer.read() - start;
+        times[i] = (zigcompat.monotonicNanos() - t0) - start;
     }
 
     const stats = BenchmarkStats.init(times);
@@ -263,7 +264,7 @@ test "benchmark: multiple timeout operations performance" {
         }
     }
 
-    var timer = try std.time.Timer.start();
+    const t0 = zigcompat.monotonicNanos();
     var times = try std.testing.allocator.alloc(u64, batches);
     defer std.testing.allocator.free(times);
 
@@ -271,7 +272,7 @@ test "benchmark: multiple timeout operations performance" {
     for (0..batches) |b| {
         @memset(callback_called, false);
 
-        const start = timer.read();
+        const start = (zigcompat.monotonicNanos() - t0);
         // 批量提交超时：一次性提交多个超时操作
         // 这测试了队列在高负载下的性能
         for (0..batch_size) |i| {
@@ -284,7 +285,7 @@ test "benchmark: multiple timeout operations performance" {
         for (0..batch_size) |_| {
             try io.run();
         }
-        times[b] = timer.read() - start;
+        times[b] = (zigcompat.monotonicNanos() - t0) - start;
     }
 
     // 计算每次操作的平均时间
@@ -343,8 +344,8 @@ test "benchmark: throughput - 10k requests per second" {
         io.run() catch {};
     }
 
-    var timer = try std.time.Timer.start();
-    const start_time = timer.read();
+    const t0 = zigcompat.monotonicNanos();
+    const start_time = (zigcompat.monotonicNanos() - t0);
 
     // 批量提交和处理请求，模拟高吞吐量场景
     for (0..num_batches) |_| {
@@ -363,7 +364,7 @@ test "benchmark: throughput - 10k requests per second" {
         }
     }
 
-    const elapsed_ns = timer.read() - start_time;
+    const elapsed_ns = (zigcompat.monotonicNanos() - t0) - start_time;
     const total_requests = batch_size * num_batches;
     const actual_rps = (total_requests * std.time.ns_per_s) / elapsed_ns;
     const avg_latency_ns = elapsed_ns / total_requests;

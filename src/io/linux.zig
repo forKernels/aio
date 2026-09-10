@@ -11,7 +11,7 @@ const log = std.log.scoped(.io);
 const constants = @import("../constants.zig");
 const stdx = @import("../stdx.zig");
 const common = @import("./common.zig");
-const Address = std.net.Address;
+const Address = @import("../zigcompat.zig").Address;
 const QueueType = @import("../queue.zig").QueueType;
 const buffer_limit = @import("../io.zig").buffer_limit;
 const DirectIO = @import("../io.zig").DirectIO;
@@ -122,7 +122,7 @@ pub const IO = struct {
         // We must use the same clock source used by io_uring (CLOCK_MONOTONIC) since we specify the
         // timeout below as an absolute value. Otherwise, we may deadlock if the clock sources are
         // dramatically different. Any kernel that supports io_uring will support CLOCK_MONOTONIC.
-        const current_ts = posix.clock_gettime(posix.CLOCK.MONOTONIC) catch unreachable;
+        const current_ts = @import("../zigcompat.zig").clockMonotonic();
         // The absolute CLOCK_MONOTONIC time after which we may return from this function:
         const timeout_ts: os.linux.kernel_timespec = .{
             .sec = current_ts.sec,
@@ -447,7 +447,10 @@ pub const IO = struct {
                         op.dir_fd,
                         op.file_path,
                         op.flags,
-                        op.mask,
+                        // STATX became a packed struct(u32) in 0.16, the same
+                        // shape change PROT went through. The op still carries
+                        // a raw u32 mask because that is what callers build.
+                        @bitCast(op.mask),
                         op.statxbuf,
                     );
                 },
@@ -616,7 +619,7 @@ pub const IO = struct {
                                 .PERM => error.AccessDenied,
                                 .EXIST => error.PathAlreadyExists,
                                 .BUSY => error.DeviceBusy,
-                                .OPNOTSUPP => error.FileLocksNotSupported,
+                                .OPNOTSUPP => error.FileLocksUnsupported,
                                 .AGAIN => error.WouldBlock,
                                 .TXTBSY => error.FileBusy,
                                 else => |errno| stdx.unexpected_errno("openat", errno),
@@ -1245,7 +1248,7 @@ pub const IO = struct {
         FileNotFound,
         NameTooLong,
         NotDir,
-    } || std.fs.File.StatError || posix.UnexpectedError;
+    } || @import("../zigcompat.zig").File.StatError || posix.UnexpectedError;
 
     pub fn statx(
         self: *IO,
@@ -1449,7 +1452,7 @@ pub const IO = struct {
         assert(event != INVALID_EVENT);
         _ = self;
 
-        posix.close(event);
+        @import("../zigcompat.zig").close(event);
     }
 
     pub const socket_t = posix.socket_t;
@@ -1457,7 +1460,7 @@ pub const IO = struct {
 
     /// Creates a TCP socket that can be used for async operations with the IO instance.
     pub fn open_socket_tcp(self: *IO, family: u32, options: TCPOptions) !socket_t {
-        const fd = try posix.socket(
+        const fd = try @import("../zigcompat.zig").socket(
             family,
             posix.SOCK.STREAM | posix.SOCK.CLOEXEC,
             posix.IPPROTO.TCP,
@@ -1471,7 +1474,7 @@ pub const IO = struct {
     /// Creates a UDP socket that can be used for async operations with the IO instance.
     pub fn open_socket_udp(self: *IO, family: u32) !socket_t {
         _ = self;
-        return try posix.socket(
+        return try @import("../zigcompat.zig").socket(
             family,
             std.posix.SOCK.DGRAM | posix.SOCK.CLOEXEC,
             posix.IPPROTO.UDP,
@@ -1481,7 +1484,7 @@ pub const IO = struct {
     /// Closes a socket opened by the IO instance.
     pub fn close_socket(self: *IO, socket: socket_t) void {
         _ = self;
-        posix.close(socket);
+        @import("../zigcompat.zig").close(socket);
     }
 
     /// Listen on the given TCP socket.
@@ -1651,7 +1654,7 @@ pub const IO = struct {
 
         const fd = try posix.openat(dir_fd, relative_path, flags, mode);
         // TODO Return a proper error message when the path exists or does not exist (init/start).
-        errdefer posix.close(fd);
+        errdefer @import("../zigcompat.zig").close(fd);
 
         {
             // Make sure we're getting the type of file descriptor we expect.
@@ -1844,7 +1847,7 @@ pub const IO = struct {
         const dir = std.fs.Dir{ .fd = dir_fd };
         const flags: posix.O = .{ .CLOEXEC = true, .CREAT = true, .TRUNC = true };
         const fd = try posix.openatZ(dir_fd, path, flags, 0o666);
-        defer posix.close(fd);
+        defer @import("../zigcompat.zig").close(fd);
         defer dir.deleteFile(path) catch {};
 
         while (true) {
@@ -1852,7 +1855,7 @@ pub const IO = struct {
             const res = os.linux.openat(dir_fd, path, dir_flags, 0);
             switch (os.linux.E.init(res)) {
                 .SUCCESS => {
-                    posix.close(@intCast(res));
+                    @import("../zigcompat.zig").close(@intCast(res));
                     return true;
                 },
                 .INTR => continue,

@@ -31,7 +31,7 @@ pub fn listen(
     options: ListenOptions,
 ) !Address {
     try setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, 1);
-    try posix.bind(fd, &address.any, address.getOsSockLen());
+    try @import("../zigcompat.zig").bind(fd, &address.any, address.getOsSockLen());
 
     // Resolve port 0 to an actual port picked by the OS.
     var address_resolved: Address = undefined;
@@ -40,7 +40,7 @@ pub fn listen(
     assert(address_resolved.getOsSockLen() == addrlen);
     assert(address_resolved.any.family == address.any.family);
 
-    try posix.listen(fd, options.backlog);
+    try @import("../zigcompat.zig").listen(fd, options.backlog);
 
     return address_resolved;
 }

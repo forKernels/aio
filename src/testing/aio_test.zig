@@ -56,8 +56,8 @@ test "accept function updated for Darwin" {
     addr_bytes[7] = 0;
 
     try posix.setsockopt(socket, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
-    try posix.bind(socket, &addr, @sizeOf(posix.sockaddr));
-    try posix.listen(socket, 1);
+    try @import("../zigcompat.zig").bind(socket, &addr, @sizeOf(posix.sockaddr));
+    try @import("../zigcompat.zig").listen(socket, 1);
 
     // Test that accept can be called - this verifies the updated accept implementation
     // The update specifically uses posix.system.accept() for Darwin instead of accept4()
