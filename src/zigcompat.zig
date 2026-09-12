@@ -55,6 +55,17 @@ pub const File = if (zig16) std.Io.File else std.fs.File;
 /// suspended, and a benchmark that silently excludes a VM migration reports a
 /// duration that never happened.
 pub fn monotonicNanos() u64 {
+    if (zig16 and darwin) {
+        // Darwin has no BOOTTIME. Its MONOTONIC is mach_continuous_time, which
+        // already counts time spent asleep, so it carries the semantic the
+        // Linux arm reaches for BOOTTIME to get. Routing through std.c matters
+        // here rather than merely being tidy: the Linux arm below issues a
+        // LINUX syscall, and on macOS that is SIGSYS. aio's six benchmark
+        // tests crashed exactly that way until this branch existed.
+        var ts: std.c.timespec = undefined;
+        _ = std.c.clock_gettime(.MONOTONIC, &ts);
+        return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+    }
     if (zig16) {
         var ts: std.os.linux.timespec = undefined;
         _ = std.os.linux.clock_gettime(.BOOTTIME, &ts);
@@ -68,16 +79,44 @@ pub fn monotonicNanos() u64 {
 
 // ── the std.posix syscall surface 0.16 moved to std.os.linux ───────────────
 // All of these went from an error union over slices to a raw syscall returning
-// usize. The 0.16 arms check errno; the 0.15.2 arms keep posix's shape. Only
-// the Linux paths are covered — darwin.zig and windows.zig are comptime-pruned
-// here and I have no machine to test them on.
+// usize. The 0.16 arms check errno; the 0.15.2 arms keep posix's shape.
+//
+// DARWIN, 2026-09-11. The note that used to sit here said the non-Linux paths
+// were "comptime-pruned here" and untestable for want of a machine. They were
+// not pruned — these functions branched on `zig16` and nothing else, so on
+// macOS + 0.16 every one of them called a LINUX syscall wrapper. Only `bind`
+// failed to compile, because it is the only one whose argument is a pointer to
+// a struct that differs between the two platforms. `socket`, `listen` and
+// `getSockName` take plain integers, type-checked clean, and would have issued
+// Linux syscall numbers on a Darwin kernel at runtime.
+//
+// That is the failure this file's own header warns about in a different key: a
+// dead-on-arrival path passes every build check because nothing analyses it
+// until something calls it. aio's test build analyses everything, which is
+// where these surfaced.
+//
+// The Linux arms below are UNCHANGED. Darwin now routes through
+// std.posix.system, which resolves to std.c when libc is linked.
+
+const darwin = builtin.os.tag.isDarwin();
 
 fn linuxErr(rc: usize) bool {
     return std.os.linux.errno(rc) != .SUCCESS;
 }
 
+/// Darwin's libc wrappers return -1 on failure rather than a negated errno, so
+/// the test is a sign check, not an errno decode.
+fn darwinErr(rc: anytype) bool {
+    return rc == -1;
+}
+
 pub fn socket(domain: u32, sock_type: u32, protocol: u32) !i32 {
     if (!zig16) return std.posix.socket(domain, sock_type, protocol);
+    if (darwin) {
+        const rc = std.posix.system.socket(domain, sock_type, protocol);
+        if (darwinErr(rc)) return error.SocketCreateFailed;
+        return @intCast(rc);
+    }
     const rc = std.os.linux.socket(domain, sock_type, protocol);
     if (linuxErr(rc)) return error.SocketCreateFailed;
     return @intCast(rc);
@@ -86,6 +125,8 @@ pub fn socket(domain: u32, sock_type: u32, protocol: u32) !i32 {
 pub fn close(fd: i32) void {
     if (!zig16) {
         std.posix.close(fd);
+    } else if (darwin) {
+        _ = std.posix.system.close(fd);
     } else {
         _ = std.os.linux.close(fd);
     }
@@ -93,11 +134,19 @@ pub fn close(fd: i32) void {
 
 pub fn bind(fd: i32, addr: *const std.posix.sockaddr, len: std.posix.socklen_t) !void {
     if (!zig16) return std.posix.bind(fd, addr, len);
+    if (darwin) {
+        if (darwinErr(std.posix.system.bind(fd, addr, len))) return error.BindFailed;
+        return;
+    }
     if (linuxErr(std.os.linux.bind(fd, addr, len))) return error.BindFailed;
 }
 
 pub fn listen(fd: i32, backlog: u31) !void {
     if (!zig16) return std.posix.listen(fd, backlog);
+    if (darwin) {
+        if (darwinErr(std.posix.system.listen(fd, backlog))) return error.ListenFailed;
+        return;
+    }
     if (linuxErr(std.os.linux.listen(fd, backlog))) return error.ListenFailed;
 }
 
@@ -130,6 +179,11 @@ pub fn clockRealtime() std.os.linux.timespec {
 pub fn getSockName(fd: i32, addr: *std.posix.sockaddr, len: *std.posix.socklen_t) !void {
     if (!zig16) return std.posix.getsockname(fd, addr, len);
     var ulen: u32 = @intCast(len.*);
+    if (darwin) {
+        if (darwinErr(std.posix.system.getsockname(fd, addr, &ulen))) return error.GetSockNameFailed;
+        len.* = @intCast(ulen);
+        return;
+    }
     if (linuxErr(std.os.linux.getsockname(fd, addr, &ulen))) return error.GetSockNameFailed;
     len.* = @intCast(ulen);
 }

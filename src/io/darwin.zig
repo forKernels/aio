@@ -1,6 +1,9 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const posix = std.posix;
+// 0.16 deleted most of std.posix's syscall surface. darwin_posix.zig restores
+// the calls this file makes, with 0.15.2's errno mappings intact, and is a
+// straight re-export of std.posix when built on 0.15.2.
+const posix = @import("./darwin_posix.zig");
 const mem = std.mem;
 const assert = std.debug.assert;
 const log = std.log.scoped(.io);
@@ -8,7 +11,9 @@ const log = std.log.scoped(.io);
 const stdx = @import("../stdx.zig");
 const constants = @import("../constants.zig");
 const common = @import("./common.zig");
-const Address = std.net.Address;
+// std.net was removed outright in 0.16, not renamed. zigcompat.Address is the
+// sockaddr carrier aio supplies in its place, and is std.net.Address on 0.15.2.
+const Address = @import("../zigcompat.zig").Address;
 const QueueType = @import("../queue.zig").QueueType;
 const Time = @import("../time.zig").Time;
 const buffer_limit = @import("../io.zig").buffer_limit;
@@ -256,7 +261,9 @@ pub const IO = struct {
         comptime callback: anytype,
         completion: *Completion,
         comptime operation_tag: std.meta.Tag(Operation),
-        operation_data: std.meta.TagPayload(Operation, operation_tag),
+        // std.meta.TagPayload was removed in 0.16. @FieldType is the replacement
+        // and exists on 0.15.2 too, so this needs no version branch.
+        operation_data: @FieldType(Operation, @tagName(operation_tag)),
         comptime OperationImpl: type,
     ) void {
         const on_complete_fn = struct {
