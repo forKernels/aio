@@ -122,7 +122,21 @@ pub fn socket(domain: u32, sock_type: u32, protocol: u32) !i32 {
     return @intCast(rc);
 }
 
-pub fn close(fd: i32) void {
+// SOCKET HANDLES ARE NOT i32 ON WINDOWS.
+//
+// These four took `fd: i32` because every 0.16 arm below calls a raw Linux or
+// Darwin syscall, where a socket descriptor really is an i32. The 0.15.2 arm
+// does not: it forwards to std.posix, which takes `socket_t` / `fd_t` — and on
+// Windows that is a `*ws2_32.SOCKET__opaque`, a pointer. So the shim refused
+// its own caller:
+//
+//   aio/src/io/common.zig:34:42: error: expected type 'i32',
+//       found '*os.windows.ws2_32.SOCKET__opaque_1653'
+//
+// forNet was the only repo that reached it, through forIO's forio_async module.
+// Typing the parameters as the std.posix aliases costs nothing on Linux and
+// Darwin, where both aliases ARE i32, so the raw-syscall arms still typecheck.
+pub fn close(fd: std.posix.fd_t) void {
     if (!zig16) {
         std.posix.close(fd);
     } else if (darwin) {
@@ -132,7 +146,7 @@ pub fn close(fd: i32) void {
     }
 }
 
-pub fn bind(fd: i32, addr: *const std.posix.sockaddr, len: std.posix.socklen_t) !void {
+pub fn bind(fd: std.posix.socket_t, addr: *const std.posix.sockaddr, len: std.posix.socklen_t) !void {
     if (!zig16) return std.posix.bind(fd, addr, len);
     if (darwin) {
         if (darwinErr(std.posix.system.bind(fd, addr, len))) return error.BindFailed;
@@ -141,7 +155,7 @@ pub fn bind(fd: i32, addr: *const std.posix.sockaddr, len: std.posix.socklen_t) 
     if (linuxErr(std.os.linux.bind(fd, addr, len))) return error.BindFailed;
 }
 
-pub fn listen(fd: i32, backlog: u31) !void {
+pub fn listen(fd: std.posix.socket_t, backlog: u31) !void {
     if (!zig16) return std.posix.listen(fd, backlog);
     if (darwin) {
         if (darwinErr(std.posix.system.listen(fd, backlog))) return error.ListenFailed;
@@ -176,7 +190,7 @@ pub fn clockRealtime() std.os.linux.timespec {
 
 /// Local address of a bound socket. 0.16 moved getsockname to the raw syscall
 /// layer with an out-param and a usize return.
-pub fn getSockName(fd: i32, addr: *std.posix.sockaddr, len: *std.posix.socklen_t) !void {
+pub fn getSockName(fd: std.posix.socket_t, addr: *std.posix.sockaddr, len: *std.posix.socklen_t) !void {
     if (!zig16) return std.posix.getsockname(fd, addr, len);
     var ulen: u32 = @intCast(len.*);
     if (darwin) {
