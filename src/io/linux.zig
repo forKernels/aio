@@ -367,6 +367,16 @@ pub const IO = struct {
         assert(completion.operation == .cancel);
         assert(completion.operation.cancel.target == self.cancel_status.queued.target);
 
+        // `target` is read BEFORE the assignment begins, which is load-bearing
+        // rather than stylistic. Zig's result-location semantics let this
+        // assignment construct the new value IN PLACE, so the union's active
+        // field has already become `.wait` by the time the block body runs --
+        // reading `self.cancel_status.queued` there panics with "access of
+        // union field 'queued' while field 'wait' is active".
+        //
+        // Found by forNet's SSE server test, which reaches this through
+        // io.cancelAll() on shutdown; it aborted the entire test binary.
+        const cancel_target = self.cancel_status.queued.target;
         self.cancel_status = status: {
             result catch |err| switch (err) {
                 error.NotRunning => break :status .next,
@@ -374,7 +384,7 @@ pub const IO = struct {
                 error.Unexpected => unreachable,
             };
             // Wait for the target operation to complete or abort.
-            break :status .{ .wait = .{ .target = self.cancel_status.queued.target } };
+            break :status .{ .wait = .{ .target = cancel_target } };
         };
     }
 
