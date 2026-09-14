@@ -850,8 +850,13 @@ pub const IO = struct {
                     if (rc != FALSE) {
                         // Without this getsockname, getpeername, setsockopt and
                         // shutdown fail on a ConnectEx socket. The option takes no
-                        // value.
-                        const none = [0]u8{};
+                        // value -- but its pointer must still be a real address.
+                        // This passed a ZERO-LENGTH array, whose address Zig may
+                        // make 0x1 (it did under ReleaseSafe), and MSWSOCK reads
+                        // through the pointer even with a length of 0: every
+                        // completed connect faulted at address 0x1. One byte,
+                        // length 0, never read for its value.
+                        const none = [1]u8{0};
                         _ = wincompat.setsockopt(op.socket, posix.SOL.SOCKET, posix.SO.UPDATE_CONNECT_CONTEXT, &none, 0);
                         return;
                     }

@@ -218,6 +218,24 @@ test "windows: loopback accept, connect, send and recv both ways, then orderly c
     try testing.expectEqual(@as(usize, 0), lb.io.io_pending);
 }
 
+test "windows: many connects on one IO -- SO_UPDATE_CONNECT_CONTEXT after each ConnectEx" {
+    // forIO's loopback benchmark faulted at address 0x1 inside MSWSOCK on its
+    // second connect: the option value was a zero-length array, whose address
+    // Zig is free to make 0x1, and Winsock reads through the pointer even with
+    // a length of 0. One connect per test (above) did not expose it.
+    var lb = try Loopback.open();
+    defer lb.close();
+    for (0..64) |_| {
+        const sockets = try connect_pair(&lb);
+        // The context update took effect: getpeername-class calls work.
+        var peer: posix.sockaddr.storage = undefined;
+        var peer_len: c_int = @sizeOf(posix.sockaddr.storage);
+        try testing.expectEqual(@as(c_int, 0), wincompat.getsockname(sockets[1], &peer, &peer_len));
+        lb.io.close_socket(sockets[1]);
+        lb.io.close_socket(sockets[0]);
+    }
+}
+
 test "windows: connect to a closed port reports ConnectionRefused" {
     // Find a port nothing listens on: bind, read it back, close.
     var lb = try Loopback.open();
