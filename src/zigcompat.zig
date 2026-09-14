@@ -27,8 +27,20 @@ pub const zig16 = builtin.zig_version.order(.{ .major = 0, .minor = 16, .patch =
 /// CONNECTS rather than being passed to a syscall. aio hands `&addr.any` and
 /// `addr.getOsSockLen()` straight to io_uring SQEs, so it needs the carrier,
 /// not the connector. On 0.15.2 this is std.net.Address unchanged.
-pub const Address = if (zig16) extern struct {
-    any: std.posix.sockaddr align(8),
+///
+/// SIZED FOR EVERY FAMILY. This was an extern struct holding one 16-byte
+/// `sockaddr`, while getOsSockLen() answers 28 for AF_INET6. bind() and
+/// connect() were handed a 28-byte length over a 16-byte object and read 12
+/// bytes past it, and common.listen's getsockname() had room for 16 bytes of a
+/// 28-byte name. Every IPv6 listen and connect was broken, on every backend.
+/// std.net.Address was a union of the family layouts on 0.15.2 for exactly
+/// this reason. `.any` is unchanged, so code that writes through it compiles as
+/// before; `.in` / `.in6` name the family layouts and `.storage` sizes it.
+pub const Address = if (zig16) extern union {
+    any: std.posix.sockaddr,
+    in: std.posix.sockaddr.in,
+    in6: std.posix.sockaddr.in6,
+    storage: std.posix.sockaddr.storage,
 
     pub fn getOsSockLen(self: Address) std.posix.socklen_t {
         return switch (self.any.family) {
