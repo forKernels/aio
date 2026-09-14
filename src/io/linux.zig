@@ -1243,13 +1243,20 @@ pub const IO = struct {
         self.enqueue(completion);
     }
 
-    /// Best effort to synchronously transfer bytes to the kernel.
+    /// Best effort to synchronously transfer bytes to the kernel. null means
+    /// "use send()", as on every backend.
+    ///
+    /// Raw sendto(2). This called std.posix.send, which 0.16 removed; nothing
+    /// referenced send_now until forIO's C ABI did, so it had never compiled.
+    /// MSG_NOSIGNAL matches the ring's send: a peer reset is an error, not SIGPIPE.
     pub fn send_now(self: *IO, socket: socket_t, buffer: []const u8) ?usize {
         _ = self;
-        return posix.send(socket, buffer, posix.MSG.DONTWAIT) catch |err| switch (err) {
-            error.WouldBlock => return null,
-            // To avoid duplicating error handling, force the caller to fallback to normal send.
-            else => return null,
+        const rc = linux.sendto(socket, buffer.ptr, buffer.len, posix.MSG.DONTWAIT | posix.MSG.NOSIGNAL, null, 0);
+        return switch (linux.errno(rc)) {
+            .SUCCESS => rc,
+            // WouldBlock and every error alike: the caller falls back to send(),
+            // which reports the error, so its handling stays in one place.
+            else => null,
         };
     }
 
