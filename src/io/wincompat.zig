@@ -94,7 +94,10 @@ pub const OVERLAPPED = if (zig16) extern struct {
 
 pub const OVERLAPPED_ENTRY = if (zig16) extern struct {
     lpCompletionKey: usize,
-    lpOverlapped: *OVERLAPPED,
+    /// Optional: a packet posted with PostQueuedCompletionStatus may carry no
+    /// OVERLAPPED. IO.wake() posts exactly that, and reading a null through a
+    /// non-optional pointer is undefined behaviour.
+    lpOverlapped: ?*OVERLAPPED,
     Internal: usize,
     dwNumberOfBytesTransferred: DWORD,
 } else w.OVERLAPPED_ENTRY;
@@ -142,6 +145,13 @@ const k32 = struct {
     ) callconv(.winapi) BOOL;
 
     extern "kernel32" fn GetFileSizeEx(hFile: HANDLE, lpFileSize: *i64) callconv(.winapi) BOOL;
+
+    extern "kernel32" fn PostQueuedCompletionStatus(
+        CompletionPort: HANDLE,
+        dwNumberOfBytesTransferred: DWORD,
+        dwCompletionKey: usize,
+        lpOverlapped: ?*OVERLAPPED,
+    ) callconv(.winapi) BOOL;
 };
 
 const ws2 = struct {
@@ -283,6 +293,18 @@ pub fn GetQueuedCompletionStatusEx(
         else => |e| unexpectedError(e),
     };
     return removed;
+}
+
+/// Queue a packet on the port with no I/O operation behind it. `overlapped` may
+/// be null, which is how IO.wake() marks its packet.
+pub fn PostQueuedCompletionStatus(
+    completion_port: HANDLE,
+    bytes_transferred: DWORD,
+    completion_key: usize,
+    overlapped: ?*OVERLAPPED,
+) error{Unexpected}!void {
+    if (k32.PostQueuedCompletionStatus(completion_port, bytes_transferred, completion_key, overlapped) == FALSE)
+        return unexpectedError(w.GetLastError());
 }
 
 pub fn CreateIoCompletionPort(

@@ -133,6 +133,8 @@ pub const IO = struct {
     /// Thread id of the thread inside flush(), 0 when none. Thread ids are
     /// never 0 on Windows.
     flushing_thread: std.atomic.Value(DWORD) = .init(0),
+    /// Set by wake(), consumed by run_for_ns(). See wake().
+    woken: std.atomic.Value(bool) = .init(false),
 
     const CancelState = enum(u8) { inactive, requested, done };
 
@@ -178,12 +180,46 @@ pub const IO = struct {
         var timed_out = false;
         var completion: Completion = undefined;
         self.timeout(*bool, &timed_out, Callback.on_timeout, &completion, nanoseconds);
+        // The timer lives in this frame. However this returns -- woken, canceled
+        // or with an error from the port -- it must not stay queued behind it.
+        defer if (!timed_out) self.discard_timer(&completion);
 
         while (!timed_out) {
             // After cancel_all() nothing is called back, including the timeout
             // above, so waiting for it would never end.
             if (self.canceled()) return;
+            // Woken: take what is ready without waiting, then return.
+            if (self.woken.swap(false, .seq_cst)) return self.flush(.non_blocking);
             try self.flush(.blocking);
+        }
+    }
+
+    /// Make the current run_for_ns() -- or the next one, if none is running --
+    /// return promptly. Safe from any thread and from a callback. Wakes
+    /// coalesce: several before one return count once.
+    ///
+    /// Without it nothing could interrupt run_for_ns(): a stop requested from
+    /// another thread waited out the caller's whole timeout.
+    ///
+    /// Posts a packet with no OVERLAPPED, which ends a blocked
+    /// GetQueuedCompletionStatusEx. reap() recognizes it by the null pointer and
+    /// no operation is owed for it. At most one is posted per consumed wake, so
+    /// they cannot pile up on the port.
+    pub fn wake(self: *IO) void {
+        if (self.woken.swap(true, .seq_cst)) return;
+        // Failure means the kernel is out of nonpaged pool. The flag stays set,
+        // and run_for_ns() sees it at its next check, bounded by its timer.
+        wincompat.PostQueuedCompletionStatus(self.iocp, 0, 0, null) catch {};
+    }
+
+    /// Take run_for_ns()'s frame-local timer off whichever queue holds it: the
+    /// timer queue, or `completed` for a zero-length run. cancel_all() may have
+    /// reset both already, which leaves nothing to take.
+    fn discard_timer(self: *IO, completion: *Completion) void {
+        if (self.timeouts.contains(completion)) {
+            self.timeouts.remove(completion);
+        } else if (self.completed.contains(completion)) {
+            self.completed.remove(completion);
         }
     }
 
@@ -243,10 +279,12 @@ pub const IO = struct {
 
     /// Account for packets taken off the port.
     fn reap(self: *IO, entries: []const wincompat.OVERLAPPED_ENTRY, disposition: Disposition) void {
-        assert(self.io_pending >= entries.len);
-        self.io_pending -= entries.len;
         for (entries) |entry| {
-            const overlapped: *Completion.Overlapped = @fieldParentPtr("raw", entry.lpOverlapped);
+            // A wake() packet: no OVERLAPPED, and no operation was owed it.
+            const raw: ?*wincompat.OVERLAPPED = entry.lpOverlapped;
+            const overlapped: *Completion.Overlapped = @fieldParentPtr("raw", raw orelse continue);
+            assert(self.io_pending > 0);
+            self.io_pending -= 1;
             const completion = overlapped.completion;
             self.inflight.remove(completion);
             switch (disposition) {

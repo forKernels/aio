@@ -29,6 +29,12 @@ pub const IO = struct {
     timeouts: QueueType(Completion) = QueueType(Completion).init(.{ .name = "io_timeouts" }),
     completed: QueueType(Completion) = QueueType(Completion).init(.{ .name = "io_completed" }),
     io_pending: QueueType(Completion) = QueueType(Completion).init(.{ .name = "io_pending" }),
+    /// Set by wake(), consumed by run_for_ns(). See wake().
+    woken: std.atomic.Value(bool) = .init(false),
+
+    /// The EVFILT_USER identifier wake() triggers. open_event() counts up from
+    /// 1, so the top of the u32 range cannot collide with an event it hands out.
+    const wake_ident: usize = std.math.maxInt(u32);
 
     pub fn init(entries: u12, flags: u32) !IO {
         _ = entries;
@@ -36,6 +42,16 @@ pub const IO = struct {
 
         const kq = try posix.kqueue();
         assert(kq > -1);
+        errdefer posix.close(kq);
+
+        // Registered once, here, so wake() is a single trigger from any thread.
+        // flush() recognizes it by filter and ident; no completion stands behind
+        // it and io_inflight does not count it.
+        var kev = mem.zeroes([1]posix.Kevent);
+        kev[0].ident = wake_ident;
+        kev[0].filter = posix.system.EVFILT.USER;
+        kev[0].flags = posix.system.EV.ADD | posix.system.EV.ENABLE | posix.system.EV.CLEAR;
+        _ = try posix.kevent(kq, &kev, kev[0..0], null);
         // 显式初始化所有字段，确保队列被正确初始化
         return IO{
             .kq = kq,
@@ -87,10 +103,42 @@ pub const IO = struct {
             nanoseconds,
         );
 
+        // The timer lives in this frame: however this returns, it must not stay queued.
+        defer if (!timed_out) self.discard_timer(&completion);
+
         // Loop until our timeout completion is processed above, which sets timed_out to true.
         // LLVM shouldn't be able to cache timed_out's value here since its address escapes above.
         while (!timed_out) {
+            // Woken: take what is ready without waiting, then return.
+            if (self.woken.swap(false, .seq_cst)) return self.flush(false);
             try self.flush(true);
+        }
+    }
+
+    /// Make the current run_for_ns() -- or the next one, if none is running --
+    /// return promptly. Safe from any thread and from a callback. Wakes
+    /// coalesce: several before one return count once.
+    ///
+    /// Triggers the EVFILT_USER event init() registered, which ends a blocked
+    /// kevent(). kevent() is safe to call on a kqueue another thread waits on.
+    pub fn wake(self: *IO) void {
+        if (self.woken.swap(true, .seq_cst)) return;
+        var kev = mem.zeroes([1]posix.Kevent);
+        kev[0].ident = wake_ident;
+        kev[0].filter = posix.system.EVFILT.USER;
+        kev[0].fflags = posix.system.NOTE.TRIGGER;
+        // Fails only without kernel memory. The flag stays set and run_for_ns()
+        // sees it at its next check, bounded by its timer.
+        _ = posix.kevent(self.kq, &kev, kev[0..0], null) catch {};
+    }
+
+    /// Take run_for_ns()'s frame-local timer off whichever queue holds it: the
+    /// timer queue, or `completed` for a zero-length run.
+    fn discard_timer(self: *IO, completion: *Completion) void {
+        if (self.timeouts.contains(completion)) {
+            self.timeouts.remove(completion);
+        } else if (self.completed.contains(completion)) {
+            self.completed.remove(completion);
         }
     }
 
@@ -134,15 +182,21 @@ pub const IO = struct {
                 &ts,
             );
 
-            // Mark the io events submitted only after kevent() successfully processed them.
-            self.io_inflight += change_events;
-            self.io_inflight -= new_events;
-
+            var wake_events: usize = 0;
             for (events[0..new_events]) |event| {
+                // wake(): no completion behind it, never counted in io_inflight.
+                if (event.filter == posix.system.EVFILT.USER and event.ident == wake_ident) {
+                    wake_events += 1;
+                    continue;
+                }
                 const completion: *Completion = @ptrFromInt(event.udata);
                 assert(completion.link.next == null);
                 self.completed.push(completion);
             }
+
+            // Mark the io events submitted only after kevent() successfully processed them.
+            self.io_inflight += change_events;
+            self.io_inflight -= new_events - wake_events;
         }
 
         var completed = self.completed;

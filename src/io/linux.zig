@@ -60,6 +60,14 @@ pub const IO = struct {
         done,
     } = .inactive,
 
+    /// wake(): an eventfd, with a read kept armed on the ring by run_for_ns().
+    wake_fd: posix.fd_t = -1,
+    wake_armed: bool = false,
+    wake_buffer: u64 = 0,
+    wake_completion: Completion = undefined,
+    /// Set by wake(), consumed by run_for_ns().
+    woken: std.atomic.Value(bool) = .init(false),
+
     pub fn init(entries: u12, flags: u32) !IO {
         // Detect the linux version to ensure that we support all io_uring ops used.
         const uts = posix.uname();
@@ -67,6 +75,12 @@ pub const IO = struct {
         if (version.order(std.SemanticVersion{ .major = 5, .minor = 5, .patch = 0 }) == .lt) {
             @panic("Linux kernel 5.5 or greater is required for io_uring OP_ACCEPT");
         }
+
+        // Before the errdefer below, whose switch names only io_uring's errors.
+        const wake_rc = linux.eventfd(0, linux.EFD.CLOEXEC);
+        if (linux.errno(wake_rc) != .SUCCESS) return error.SystemResources;
+        const wake_fd: posix.fd_t = @intCast(wake_rc);
+        errdefer _ = linux.close(wake_fd);
 
         errdefer |err| switch (err) {
             error.SystemOutdated => {
@@ -81,11 +95,13 @@ pub const IO = struct {
             else => {},
         };
 
-        return IO{ .ring = try IO_Uring.init(entries, flags) };
+        return IO{ .ring = try IO_Uring.init(entries, flags), .wake_fd = wake_fd };
     }
 
     pub fn deinit(self: *IO) void {
         self.ring.deinit();
+        if (self.wake_fd != -1) _ = linux.close(self.wake_fd);
+        self.wake_fd = -1;
     }
 
     /// Pass all queued submissions to the kernel and peek for completions.
@@ -119,6 +135,14 @@ pub const IO = struct {
     pub fn run_for_ns(self: *IO, nanoseconds: u63) !void {
         assert(self.cancel_status != .done);
 
+        // Keep a read armed on the wake eventfd while the loop can block, so a
+        // wake() from another thread ends the wait below. Not during cancel_all(),
+        // which runs this loop itself and admits no new operation (enqueue()).
+        if (!self.wake_armed and self.cancel_status == .inactive) {
+            self.wake_armed = true;
+            self.read(*IO, self, on_wake_read, &self.wake_completion, self.wake_fd, std.mem.asBytes(&self.wake_buffer), 0);
+        }
+
         // We must use the same clock source used by io_uring (CLOCK_MONOTONIC) since we specify the
         // timeout below as an absolute value. Otherwise, we may deadlock if the clock sources are
         // dramatically different. Any kernel that supports io_uring will support CLOCK_MONOTONIC.
@@ -131,6 +155,11 @@ pub const IO = struct {
         var timeouts: usize = 0;
         var etime = false;
         while (!etime) {
+            // Woken: take what is ready without waiting, then return.
+            if (self.woken.swap(false, .seq_cst)) {
+                try self.flush(0, &timeouts, &etime);
+                break;
+            }
             const timeout_sqe = self.ring.get_sqe() catch blk: {
                 // The submission queue is full, so flush submissions to make space:
                 try self.flush_submissions(0, &timeouts, &etime);
@@ -147,6 +176,21 @@ pub const IO = struct {
 
             // The amount of time this call will block is bounded by the timeout we just submitted:
             try self.flush(1, &timeouts, &etime);
+        }
+        // A wake() ends the loop above before its absolute timeouts expire. Each
+        // completes at its deadline or once some LATER completion is posted (count
+        // 1), and the reap below busy-waits for them. A wake whose eventfd read
+        // completed before this round's timeout was queued leaves that timeout
+        // with no later completion coming, and the reap would spin a core until
+        // the deadline. So post one: a NOP, tagged 0 and counted like a timeout.
+        if (!etime and timeouts > 0) {
+            _ = self.ring.nop(0) catch blk: {
+                try self.flush_submissions(0, &timeouts, &etime);
+                break :blk self.ring.nop(0) catch unreachable;
+            };
+            timeouts += 1;
+            self.ios_queued += 1;
+            try self.flush_submissions(0, &timeouts, &etime);
         }
         // Reap any remaining timeouts, which reference the timespec in the current stack frame.
         // The busy loop here is required to avoid a potential deadlock, as the kernel determines
@@ -1258,6 +1302,29 @@ pub const IO = struct {
             // which reports the error, so its handling stays in one place.
             else => null,
         };
+    }
+
+    /// Make the current run_for_ns() -- or the next one, if none is running --
+    /// return promptly. Safe from any thread and from a callback. Wakes
+    /// coalesce: several before one return count once.
+    ///
+    /// Without it nothing could interrupt run_for_ns(): a stop requested from
+    /// another thread waited out the caller's whole timeout.
+    ///
+    /// Writes the eventfd, which completes the read run_for_ns() keeps armed and
+    /// so ends io_uring_enter's wait.
+    pub fn wake(self: *IO) void {
+        if (self.woken.swap(true, .seq_cst)) return;
+        const one: u64 = 1;
+        // An eventfd write fails only at a counter of 2^64-2; wakes coalesce long
+        // before that.
+        _ = linux.write(self.wake_fd, std.mem.asBytes(&one), @sizeOf(u64));
+    }
+
+    fn on_wake_read(self: *IO, _: *Completion, result: ReadError!usize) void {
+        // The count does not matter: `woken` is what run_for_ns() reads.
+        _ = result catch {};
+        self.wake_armed = false;
     }
 
     pub const StatxError = error{

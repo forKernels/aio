@@ -103,7 +103,7 @@ test "accept function updated for Darwin" {
     }
 }
 
-// ── IPv6, on every backend ────────────────────────────────────────
+// ── IPv6 and wake(), on every backend ────────────────────────────────────────
 //
 // Named os_posix because the Darwin test above declares a local `posix`, and a
 // local may not shadow a container declaration.
@@ -223,4 +223,57 @@ test "IPv6 loopback: listen resolves the port; connect, accept, send and recv" {
     io.recv(*Echo, &ctx, Echo.on_recv, &accept_completion, server, &ctx.buffer);
     try run_until(&io, &ctx, Echo.echoed);
     try std.testing.expectEqualStrings(message, ctx.buffer[0..ctx.received]);
+}
+
+fn spin_until(deadline_ns: u64) void {
+    var timer = Time{};
+    while (timer.monotonic() < deadline_ns) std.Thread.yield() catch {};
+}
+
+test "wake() from another thread ends run_for_ns long before its timeout" {
+    var io = try IO.init(32, 0);
+    defer io.deinit();
+
+    var timer = Time{};
+    const start = timer.monotonic();
+    const Waker = struct {
+        fn run(target: *IO, at_ns: u64) void {
+            spin_until(at_ns);
+            target.wake();
+        }
+    };
+    const thread = try std.Thread.spawn(.{}, Waker.run, .{ &io, start + 50 * std.time.ns_per_ms });
+    try io.run_for_ns(20 * std.time.ns_per_s);
+    const elapsed = timer.monotonic() - start;
+    thread.join();
+
+    // Returned because of the wake, not spuriously before it...
+    try std.testing.expect(elapsed >= 40 * std.time.ns_per_ms);
+    // ...and not by running out the 20 s timeout.
+    try std.testing.expect(elapsed < 5 * std.time.ns_per_s);
+}
+
+test "wake() before run_for_ns returns at once; wakes coalesce into one return" {
+    var io = try IO.init(32, 0);
+    defer io.deinit();
+    var timer = Time{};
+
+    io.wake();
+    io.wake();
+    io.wake();
+    const t0 = timer.monotonic();
+    try io.run_for_ns(20 * std.time.ns_per_s);
+    try std.testing.expect(timer.monotonic() - t0 < 5 * std.time.ns_per_s);
+
+    // The three wakes were one: this run is not cut short.
+    const t1 = timer.monotonic();
+    try io.run_for_ns(30 * std.time.ns_per_ms);
+    try std.testing.expect(timer.monotonic() - t1 >= 30 * std.time.ns_per_ms);
+}
+
+test "cancel_all() after run_for_ns returns, with the wake read armed" {
+    var io = try IO.init(32, 0);
+    defer io.deinit();
+    try io.run_for_ns(std.time.ns_per_ms);
+    io.cancel_all();
 }
