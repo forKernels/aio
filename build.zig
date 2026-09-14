@@ -47,8 +47,23 @@ pub fn build(b: *std.Build) void {
     });
     module.addImport("reify", reify_module);
 
+    // The test gets its OWN module, never the exported `aio` one. Under 0.16
+    // addObjectFile attaches to the MODULE, not the compile step, so the forTime
+    // archive the Windows test links below would otherwise ride along into every
+    // consumer of `aio`: forIO's forio_async, and through it forNet's archive
+    // object. On COFF that was not merely redundant -- forNet's windows-gnu
+    // fornet.obj came out as forTime's archive with forNet's own code unit gone,
+    // and libfornet.a shipped 0 of its 53 fnet_ exports. forIO's build.zig
+    // records the same 0.16 trap for its pack tests.
+    const test_module = b.createModule(.{
+        .root_source_file = b.path("src/aio.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_module.addImport("reify", reify_module);
+
     const unit_tests = b.addTest(.{
-        .root_module = module,
+        .root_module = test_module,
     });
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
