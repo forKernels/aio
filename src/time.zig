@@ -12,6 +12,24 @@ const is_windows = builtin.target.os.tag == .windows;
 const is_linux = builtin.target.os.tag == .linux;
 const Instant = stdx.Instant;
 
+/// forTime's clock C-ABI, reached as a PREBUILT archive, never as source.
+///
+/// WINDOWS ONLY. Both externs are referenced from the Windows arms of `Time`
+/// and nowhere else, and an extern nothing references is never emitted -- so a
+/// Linux or Darwin build of aio carries no ftim_* symbol and its clocks are
+/// exactly what they were. On Windows the symbols stay UNDEFINED in whatever
+/// object holds aio (forIO's packs, libfornet.a), and the final executable
+/// resolves them against ../forTime/prebuilt/winX86/libfortime.a (GNU ABI) or
+/// fortime.lib (MSVC ABI). aio's own Windows test links that archive in
+/// build.zig for the same reason forIO's and forNet's tests do.
+///
+/// Signatures match forIO's fortime_bridge.zig and forNet's declarations, so
+/// the one symbol has one type wherever these modules share a compilation.
+const fortime = struct {
+    extern fn ftim_mono_ns() callconv(.c) u64;
+    extern fn ftim_now_unix_ns() callconv(.c) i64;
+};
+
 pub const Time = struct {
     /// Hardware and/or software bugs can mean that the monotonic clock may regress.
     /// One example (of many): https://bugzilla.redhat.com/show_bug.cgi?id=448449
@@ -43,30 +61,21 @@ pub const Time = struct {
 
     fn monotonic_windows() u64 {
         assert(is_windows);
-        // Uses QueryPerformanceCounter() on windows due to it being the highest precision timer
-        // available while also accounting for time spent suspended by default:
+        // forTime's monotonic clock: QueryPerformanceCounter, which counts time
+        // spent suspended -- the same semantic this arm had when it read QPC
+        // itself, and the one the Linux arm reaches for CLOCK_BOOTTIME to get.
         //
-        // https://docs.microsoft.com/en-us/windows/win32/api/realtimeapiset/nf-realtimeapiset-queryunbiasedinterrupttime#remarks
-
-        // QPF need not be globally cached either as it ends up being a load from read-only memory
-        // mapped to all processed by the kernel called KUSER_SHARED_DATA (See "QpcFrequency")
+        // 0.16 removed std.os.windows.QueryPerformanceCounter, and the fleet
+        // does not hand-roll a replacement clock: forTime owns every clock, and
+        // a consumer links its PREBUILT archive and declares the extern at the
+        // call site (forTime docs/INTEGRATION.md). See `fortime` below.
         //
-        // https://docs.microsoft.com/en-us/windows-hardware/drivers/ddi/ntddk/ns-ntddk-kuser_shared_data
-        // https://www.geoffchappell.com/studies/windows/km/ntoskrnl/inc/api/ntexapi_x/kuser_shared_data/index.htm
-        const qpc = os.windows.QueryPerformanceCounter();
-        const qpf = os.windows.QueryPerformanceFrequency();
-
-        // 10Mhz (1 qpc tick every 100ns) is a common QPF on modern systems.
-        // We can optimize towards this by converting to ns via a single multiply.
-        //
-        // https://github.com/microsoft/STL/blob/785143a0c73f030238ef618890fd4d6ae2b3a3a0/stl/inc/chrono#L694-L701
-        const common_qpf = 10_000_000;
-        if (qpf == common_qpf) return qpc * (std.time.ns_per_s / common_qpf);
-
-        // Convert qpc to nanos using fixed point to avoid expensive extra divs and
-        // overflow.
-        const scale = (std.time.ns_per_s << 32) / qpf;
-        return @as(u64, @truncate((@as(u96, qpc) * scale) >> 32));
+        // ftim_mono_ns returns 0 only when no monotonic clock is usable, which
+        // no Windows since XP lacks. A 0 here would trip nothing silently: the
+        // timeout queue would simply never expire, so it is asserted instead.
+        const now = fortime.ftim_mono_ns();
+        assert(now != 0);
+        return now;
     }
 
     fn monotonic_darwin() u64 {
@@ -115,27 +124,12 @@ pub const Time = struct {
     }
 
     fn realtime_windows() i64 {
-        // TODO(zig): Maybe use `std.time.nanoTimestamp()`.
-        // https://github.com/ziglang/zig/pull/22871
         assert(is_windows);
-        const get_system_time_precise_as_file_time = @extern(
-            *const fn (
-                lpFileTime: *os.windows.FILETIME,
-            ) callconv(os.windows.WINAPI) void,
-            .{
-                .library_name = "kernel32",
-                .name = "GetSystemTimePreciseAsFileTime",
-            },
-        );
-
-        var ft: os.windows.FILETIME = undefined;
-        get_system_time_precise_as_file_time(&ft);
-        const ft64 = (@as(u64, ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
-
-        // FileTime is in units of 100 nanoseconds
-        // and uses the NTFS/Windows epoch of 1601-01-01 instead of Unix Epoch 1970-01-01.
-        const epoch_adjust = std.time.epoch.windows * (std.time.ns_per_s / 100);
-        return (@as(i64, @bitCast(ft64)) + epoch_adjust) * 100;
+        // WALL clock, nanoseconds since the Unix epoch -- what this arm returned
+        // when it read GetSystemTimePreciseAsFileTime and rebased FILETIME's 1601
+        // epoch itself. 0.16 removed os.windows.WINAPI, which that @extern
+        // needed; forTime supplies the same reading (see `fortime` below).
+        return fortime.ftim_now_unix_ns();
     }
 
     fn realtime_unix() i64 {
