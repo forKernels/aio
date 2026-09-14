@@ -101,11 +101,15 @@ pub fn tcp_options(
         }
     }
 
-    // Set tcp no-delay
+    // TCP_NODELAY on EVERY platform. It was Linux-only, so `nodelay = true`
+    // silently did nothing on Windows and macOS, where a request/response
+    // protocol then waits on Nagle plus the peer's delayed ACK. The option is
+    // the same on POSIX and Winsock (IPPROTO_TCP, TCP_NODELAY); setsockopt()
+    // below routes Windows through Winsock. Keepalive's per-connection tunables
+    // above stay Linux-only: TCP_KEEPIDLE/KEEPINTVL/KEEPCNT have no uniform
+    // spelling elsewhere.
     if (options.nodelay) {
-        if (is_linux) {
-            try setsockopt(fd, posix.IPPROTO.TCP, posix.TCP.NODELAY, 1);
-        }
+        try setsockopt(fd, posix.IPPROTO.TCP, posix.TCP.NODELAY, 1);
     }
 }
 
