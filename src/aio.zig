@@ -22,4 +22,7 @@ pub const Address = @import("zigcompat.zig").Address;
 test {
     _ = @import("testing/benchmark.zig");
     _ = @import("testing/aio_test.zig");
+    // The IOCP backend against the real kernel. Windows-only, so the Linux and
+    // Darwin test counts are exactly what they were.
+    if (@import("builtin").os.tag == .windows) _ = @import("testing/windows_io_test.zig");
 }
