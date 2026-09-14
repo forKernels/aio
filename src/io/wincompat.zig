@@ -25,7 +25,9 @@ pub const BOOL = w.BOOL;
 pub const ULONG = w.ULONG;
 pub const BYTE = w.BYTE;
 pub const GUID = w.GUID;
-pub const TRUE = w.TRUE;
+/// 0.16 made BOOL an enum and dropped the top-level TRUE with it, so the
+/// re-export failed the first time anything named it.
+pub const TRUE: BOOL = if (zig16) @enumFromInt(1) else w.TRUE;
 pub const INVALID_HANDLE_VALUE = w.INVALID_HANDLE_VALUE;
 pub const IO_STATUS_BLOCK = w.IO_STATUS_BLOCK;
 pub const UNICODE_STRING = w.UNICODE_STRING;
@@ -63,7 +65,10 @@ pub const INVALID_SOCKET: SOCKET = if (zig16) @ptrFromInt(std.math.maxInt(usize)
 pub const SOCKET_ERROR: c_int = if (zig16) -1 else w.ws2_32.SOCKET_ERROR;
 pub const WSA_FLAG_OVERLAPPED: DWORD = if (zig16) 0x01 else w.ws2_32.WSA_FLAG_OVERLAPPED;
 pub const WSA_FLAG_NO_HANDLE_INHERIT: DWORD = if (zig16) 0x80 else w.ws2_32.WSA_FLAG_NO_HANDLE_INHERIT;
-pub const SIO_GET_EXTENSION_FUNCTION_POINTER: DWORD = if (zig16) 0xC800_6006 else w.ws2_32.SIO_GET_EXTENSION_FUNCTION_POINTER;
+/// _WSAIORW(IOC_WS2, 6) = IOC_INOUT 0xC0000000 | IOC_WS2 0x08000000 | 6.
+/// It was 0xC800_6006, which Winsock rejects with WSAEINVAL: no ConnectEx could
+/// ever be looked up, so every aio connect on Windows failed.
+pub const SIO_GET_EXTENSION_FUNCTION_POINTER: DWORD = if (zig16) 0xC800_0006 else w.ws2_32.SIO_GET_EXTENSION_FUNCTION_POINTER;
 
 /// {25a207b9-ddf3-4660-8ee9-76e58c74063e} — the ConnectEx extension.
 pub const WSAID_CONNECTEX: GUID = if (zig16) .{
@@ -154,7 +159,9 @@ const ws2 = struct {
     extern "ws2_32" fn bind(s: SOCKET, addr: *const anyopaque, len: c_int) callconv(.winapi) c_int;
     extern "ws2_32" fn listen(s: SOCKET, backlog: c_int) callconv(.winapi) c_int;
     extern "ws2_32" fn getsockname(s: SOCKET, addr: *anyopaque, addrlen: *c_int) callconv(.winapi) c_int;
-    extern "ws2_32" fn setsockopt(s: SOCKET, level: c_int, optname: c_int, optval: ?[*]const u8, optlen: c_int) callconv(.winapi) c_int;
+    // optval is NON-optional, as forNet's sock.zig declares it. A caller with no
+    // value (SO_UPDATE_CONNECT_CONTEXT) passes a zero-length buffer.
+    extern "ws2_32" fn setsockopt(s: SOCKET, level: c_int, optname: c_int, optval: [*]const u8, optlen: c_int) callconv(.winapi) c_int;
 };
 
 pub const GetFileSizeEx = if (zig16) k32.GetFileSizeEx else w.GetFileSizeEx;
@@ -269,7 +276,10 @@ pub fn GetQueuedCompletionStatusEx(
         .ABANDONED_WAIT_0 => error.Aborted,
         .OPERATION_ABORTED => error.Cancelled,
         .HANDLE_EOF => error.EOF,
-        .TIMEOUT => error.Timeout,
+        // A wait that elapses reports WAIT_TIMEOUT (258), NOT ERROR_TIMEOUT
+        // (1460). Matching only .TIMEOUT turned every timed-out wait -- each
+        // blocking flush on a timer -- into error.Unexpected.
+        .WAIT_TIMEOUT, .TIMEOUT => error.Timeout,
         else => |e| unexpectedError(e),
     };
     return removed;
@@ -319,6 +329,63 @@ pub fn closeSocket(s: SOCKET) void {
 const ws2c = struct {
     extern "ws2_32" fn closesocket(s: SOCKET) callconv(.winapi) c_int;
 };
+
+/// Raw closesocket, for a caller that must report the failure (IO.close).
+pub const closesocket = ws2c.closesocket;
+
+// ── IOCP backend entry points 0.16 removed (overlapped sockets, files) ──────
+//
+// 0.16's std declares none of these (kernel32.zig carries only CreateProcessW,
+// ws2_32.zig no functions at all), so there is no std declaration for them to
+// disagree with. Zig-only; the 0.15.2 arms above keep their std shapes.
+
+pub const GENERIC_READ: DWORD = 0x8000_0000;
+pub const GENERIC_WRITE: DWORD = 0x4000_0000;
+pub const FILE_LIST_DIRECTORY: DWORD = 0x0001;
+pub const FILE_TRAVERSE: DWORD = 0x0020;
+pub const FILE_SHARE_READ: DWORD = 0x1;
+pub const FILE_SHARE_WRITE: DWORD = 0x2;
+pub const FILE_SHARE_DELETE: DWORD = 0x4;
+pub const FILE_FLAG_BACKUP_SEMANTICS: DWORD = 0x0200_0000;
+pub const LOCKFILE_FAIL_IMMEDIATELY: DWORD = 0x1;
+pub const LOCKFILE_EXCLUSIVE_LOCK: DWORD = 0x2;
+pub const PATH_MAX_WIDE = w.PATH_MAX_WIDE;
+
+const k32io = struct {
+    extern "kernel32" fn CancelIoEx(hFile: HANDLE, lpOverlapped: ?*OVERLAPPED) callconv(.winapi) BOOL;
+    extern "kernel32" fn ReadFile(hFile: HANDLE, lpBuffer: [*]u8, nNumberOfBytesToRead: DWORD, lpNumberOfBytesRead: ?*DWORD, lpOverlapped: ?*OVERLAPPED) callconv(.winapi) BOOL;
+    extern "kernel32" fn WriteFile(hFile: HANDLE, lpBuffer: [*]const u8, nNumberOfBytesToWrite: DWORD, lpNumberOfBytesWritten: ?*DWORD, lpOverlapped: ?*OVERLAPPED) callconv(.winapi) BOOL;
+    extern "kernel32" fn GetOverlappedResult(hFile: HANDLE, lpOverlapped: *OVERLAPPED, lpNumberOfBytesTransferred: *DWORD, bWait: BOOL) callconv(.winapi) BOOL;
+    extern "kernel32" fn FlushFileBuffers(hFile: HANDLE) callconv(.winapi) BOOL;
+    extern "kernel32" fn LockFileEx(hFile: HANDLE, dwFlags: DWORD, dwReserved: DWORD, nNumberOfBytesToLockLow: DWORD, nNumberOfBytesToLockHigh: DWORD, lpOverlapped: *OVERLAPPED) callconv(.winapi) BOOL;
+    extern "kernel32" fn SetFilePointerEx(hFile: HANDLE, liDistanceToMove: i64, lpNewFilePointer: ?*i64, dwMoveMethod: DWORD) callconv(.winapi) BOOL;
+    extern "kernel32" fn SetEndOfFile(hFile: HANDLE) callconv(.winapi) BOOL;
+    extern "kernel32" fn CreateFileW(lpFileName: [*:0]const u16, dwDesiredAccess: DWORD, dwShareMode: DWORD, lpSecurityAttributes: ?*anyopaque, dwCreationDisposition: DWORD, dwFlagsAndAttributes: DWORD, hTemplateFile: ?HANDLE) callconv(.winapi) HANDLE;
+    extern "kernel32" fn GetCurrentThreadId() callconv(.winapi) DWORD;
+    // Typed as forNet's zigcompat.zig declares it.
+    extern "kernel32" fn Sleep(dwMilliseconds: u32) callconv(.winapi) void;
+    extern "mswsock" fn AcceptEx(sListenSocket: SOCKET, sAcceptSocket: SOCKET, lpOutputBuffer: *anyopaque, dwReceiveDataLength: DWORD, dwLocalAddressLength: DWORD, dwRemoteAddressLength: DWORD, lpdwBytesReceived: *DWORD, lpOverlapped: *OVERLAPPED) callconv(.winapi) BOOL;
+};
+
+pub const CancelIoEx = k32io.CancelIoEx;
+pub const ReadFile = k32io.ReadFile;
+pub const WriteFile = k32io.WriteFile;
+pub const GetOverlappedResult = k32io.GetOverlappedResult;
+pub const FlushFileBuffers = k32io.FlushFileBuffers;
+pub const LockFileEx = k32io.LockFileEx;
+pub const SetFilePointerEx = k32io.SetFilePointerEx;
+pub const SetEndOfFile = k32io.SetEndOfFile;
+pub const CreateFileW = k32io.CreateFileW;
+pub const GetCurrentThreadId = k32io.GetCurrentThreadId;
+pub const Sleep = k32io.Sleep;
+pub const AcceptEx = k32io.AcceptEx;
+
+/// std 0.15.2's GetFileSizeEx wrapper shape: the size, or an error.
+pub fn getFileSize(handle: HANDLE) !u64 {
+    var size: i64 = 0;
+    if (GetFileSizeEx(handle, &size) == FALSE) return unexpectedError(w.GetLastError());
+    return @intCast(size);
+}
 
 /// std.posix.AcceptError / SetSockOptError are gone in 0.16.
 pub const AcceptError = error{
