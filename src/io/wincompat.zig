@@ -149,12 +149,81 @@ const ws2 = struct {
     extern "ws2_32" fn WSAIoctl(s: SOCKET, dwIoControlCode: DWORD, lpvInBuffer: ?*const anyopaque, cbInBuffer: DWORD, lpvOutBuffer: ?*anyopaque, cbOutBuffer: DWORD, lpcbBytesReturned: *DWORD, lpOverlapped: ?*OVERLAPPED, lpCompletionRoutine: ?*const anyopaque) callconv(.winapi) c_int;
     extern "ws2_32" fn WSAGetOverlappedResult(s: SOCKET, lpOverlapped: *OVERLAPPED, lpcbTransfer: *DWORD, fWait: BOOL, lpdwFlags: *DWORD) callconv(.winapi) BOOL;
     extern "ws2_32" fn getsockopt(s: SOCKET, level: c_int, optname: c_int, optval: [*]u8, optlen: *c_int) callconv(.winapi) c_int;
+    // bind/listen/getsockname: typed exactly as forNet's sock.zig declares them,
+    // so the one symbol has one type when aio and forNet share a compilation.
+    extern "ws2_32" fn bind(s: SOCKET, addr: *const anyopaque, len: c_int) callconv(.winapi) c_int;
+    extern "ws2_32" fn listen(s: SOCKET, backlog: c_int) callconv(.winapi) c_int;
+    extern "ws2_32" fn getsockname(s: SOCKET, addr: *anyopaque, addrlen: *c_int) callconv(.winapi) c_int;
     extern "ws2_32" fn setsockopt(s: SOCKET, level: c_int, optname: c_int, optval: ?[*]const u8, optlen: c_int) callconv(.winapi) c_int;
 };
 
 pub const GetFileSizeEx = if (zig16) k32.GetFileSizeEx else w.GetFileSizeEx;
 
-pub const WSAGetLastError = if (zig16) ws2.WSAGetLastError else w.ws2_32.WSAGetLastError;
+/// Winsock error codes (winerror.h). 0.16 removed ws2_32.WinsockError along with
+/// every Winsock function; these are fixed ABI values, and the backend switches
+/// on them by name. Non-exhaustive, so an unlisted code is a value, not UB.
+pub const WinsockError = if (zig16) enum(u16) {
+    WSA_INVALID_HANDLE = 6,
+    WSA_NOT_ENOUGH_MEMORY = 8,
+    WSA_INVALID_PARAMETER = 87,
+    WSA_OPERATION_ABORTED = 995,
+    WSA_IO_INCOMPLETE = 996,
+    WSA_IO_PENDING = 997,
+    WSAEINTR = 10004,
+    WSAEBADF = 10009,
+    WSAEACCES = 10013,
+    WSAEFAULT = 10014,
+    WSAEINVAL = 10022,
+    WSAEMFILE = 10024,
+    WSAEWOULDBLOCK = 10035,
+    WSAEINPROGRESS = 10036,
+    WSAEALREADY = 10037,
+    WSAENOTSOCK = 10038,
+    WSAEDESTADDRREQ = 10039,
+    WSAEMSGSIZE = 10040,
+    WSAEPROTOTYPE = 10041,
+    WSAENOPROTOOPT = 10042,
+    WSAEPROTONOSUPPORT = 10043,
+    WSAESOCKTNOSUPPORT = 10044,
+    WSAEOPNOTSUPP = 10045,
+    WSAEPFNOSUPPORT = 10046,
+    WSAEAFNOSUPPORT = 10047,
+    WSAEADDRINUSE = 10048,
+    WSAEADDRNOTAVAIL = 10049,
+    WSAENETDOWN = 10050,
+    WSAENETUNREACH = 10051,
+    WSAENETRESET = 10052,
+    WSAECONNABORTED = 10053,
+    WSAECONNRESET = 10054,
+    WSAENOBUFS = 10055,
+    WSAEISCONN = 10056,
+    WSAENOTCONN = 10057,
+    WSAESHUTDOWN = 10058,
+    WSAETOOMANYREFS = 10059,
+    WSAETIMEDOUT = 10060,
+    WSAECONNREFUSED = 10061,
+    WSAELOOP = 10062,
+    WSAENAMETOOLONG = 10063,
+    WSAEHOSTDOWN = 10064,
+    WSAEHOSTUNREACH = 10065,
+    WSASYSNOTREADY = 10091,
+    WSAVERNOTSUPPORTED = 10092,
+    WSANOTINITIALISED = 10093,
+    WSAEDISCON = 10101,
+    _,
+} else w.ws2_32.WinsockError;
+
+/// The raw entry point returns an int; every aio call site switches on the
+/// named code, as it did against 0.15.2's typed wrapper.
+pub fn WSAGetLastError() WinsockError {
+    if (!zig16) return w.ws2_32.WSAGetLastError();
+    const code = ws2.WSAGetLastError();
+    return @enumFromInt(std.math.cast(u16, code) orelse std.math.maxInt(u16));
+}
+
+pub const bind = ws2.bind;
+pub const listen = ws2.listen;
+pub const getsockname = ws2.getsockname;
 pub const WSARecv = if (zig16) ws2.WSARecv else w.ws2_32.WSARecv;
 pub const WSASend = if (zig16) ws2.WSASend else w.ws2_32.WSASend;
 pub const WSAIoctl = if (zig16) ws2.WSAIoctl else w.ws2_32.WSAIoctl;

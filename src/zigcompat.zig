@@ -55,6 +55,19 @@ pub const File = if (zig16) std.Io.File else std.fs.File;
 /// suspended, and a benchmark that silently excludes a VM migration reports a
 /// duration that never happened.
 pub fn monotonicNanos() u64 {
+    if (windows) {
+        // WINDOWS, 2026-09-14. There was no Windows arm, so on 0.16 this fell
+        // through to the `std.os.linux.clock_gettime` arm below and executed a
+        // LINUX syscall instruction on a Windows kernel. It compiled -- std.os.linux
+        // is plain Zig, analysable for any target -- and aio's six benchmark
+        // tests "passed" on Windows timing garbage. Same failure the Darwin note
+        // below records, on the third platform.
+        //
+        // forTime's clock, via its prebuilt archive: the same source Time uses
+        // on Windows (src/time.zig), so a benchmark and the timeout queue read
+        // one clock.
+        return fortime.ftim_mono_ns();
+    }
     if (zig16 and darwin) {
         // Darwin has no BOOTTIME. Its MONOTONIC is mach_continuous_time, which
         // already counts time spent asleep, so it carries the semantic the
@@ -99,6 +112,21 @@ pub fn monotonicNanos() u64 {
 // std.posix.system, which resolves to std.c when libc is linked.
 
 const darwin = builtin.os.tag.isDarwin();
+
+// WINDOWS, 2026-09-14. Winsock arms for bind/listen/getSockName, which
+// common.listen reaches on every platform. Before this they had none, so 0.16 on
+// Windows fell through to std.os.linux -- Linux syscalls again. The externs live
+// in io/wincompat.zig beside the rest of aio's Win32 bindings, typed exactly as
+// forNet's sock.zig declares the same Winsock entry points. Every arm is behind a
+// comptime-known `windows`, so no POSIX build analyses them.
+const windows = builtin.os.tag == .windows;
+const wincompat = @import("io/wincompat.zig");
+
+/// forTime's C-ABI, PREBUILT archive, call-site extern -- see src/time.zig.
+/// Referenced only from the Windows arm of monotonicNanos.
+const fortime = struct {
+    extern fn ftim_mono_ns() callconv(.c) u64;
+};
 
 fn linuxErr(rc: usize) bool {
     return std.os.linux.errno(rc) != .SUCCESS;
@@ -148,6 +176,10 @@ pub fn close(fd: std.posix.fd_t) void {
 
 pub fn bind(fd: std.posix.socket_t, addr: *const std.posix.sockaddr, len: std.posix.socklen_t) !void {
     if (!zig16) return std.posix.bind(fd, addr, len);
+    if (windows) {
+        if (wincompat.bind(fd, addr, @intCast(len)) != 0) return error.BindFailed;
+        return;
+    }
     if (darwin) {
         if (darwinErr(std.posix.system.bind(fd, addr, len))) return error.BindFailed;
         return;
@@ -157,6 +189,10 @@ pub fn bind(fd: std.posix.socket_t, addr: *const std.posix.sockaddr, len: std.po
 
 pub fn listen(fd: std.posix.socket_t, backlog: u31) !void {
     if (!zig16) return std.posix.listen(fd, backlog);
+    if (windows) {
+        if (wincompat.listen(fd, backlog) != 0) return error.ListenFailed;
+        return;
+    }
     if (darwin) {
         if (darwinErr(std.posix.system.listen(fd, backlog))) return error.ListenFailed;
         return;
@@ -192,6 +228,13 @@ pub fn clockRealtime() std.os.linux.timespec {
 /// layer with an out-param and a usize return.
 pub fn getSockName(fd: std.posix.socket_t, addr: *std.posix.sockaddr, len: *std.posix.socklen_t) !void {
     if (!zig16) return std.posix.getsockname(fd, addr, len);
+    if (windows) {
+        // Winsock takes and returns an int length, not socklen_t.
+        var ilen: c_int = @intCast(len.*);
+        if (wincompat.getsockname(fd, addr, &ilen) != 0) return error.GetSockNameFailed;
+        len.* = @intCast(ilen);
+        return;
+    }
     var ulen: u32 = @intCast(len.*);
     if (darwin) {
         if (darwinErr(std.posix.system.getsockname(fd, addr, &ulen))) return error.GetSockNameFailed;

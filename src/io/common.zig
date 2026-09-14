@@ -6,6 +6,7 @@ const posix = std.posix;
 const assert = std.debug.assert;
 
 const is_linux = builtin.target.os.tag == .linux;
+const is_windows = builtin.target.os.tag == .windows;
 
 pub const Address = @import("../zigcompat.zig").Address;
 
@@ -30,7 +31,13 @@ pub fn listen(
     address: Address,
     options: ListenOptions,
 ) !Address {
-    try setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, 1);
+    // NOT on Windows. On POSIX SO_REUSEADDR lets a restarted server rebind a
+    // port still in TIME_WAIT, which Windows permits without asking. Windows'
+    // SO_REUSEADDR is a different option: it lets a SECOND socket bind a port
+    // that is already LISTENING and take its connections. Setting it there
+    // turns "restart quickly" into "hijackable listener". forNet's sock.zig
+    // makes the same call for its own Winsock listeners.
+    if (!is_windows) try setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, 1);
     try @import("../zigcompat.zig").bind(fd, &address.any, address.getOsSockLen());
 
     // Resolve port 0 to an actual port picked by the OS.
@@ -103,5 +110,26 @@ pub fn tcp_options(
 }
 
 pub fn setsockopt(fd: posix.socket_t, level: i32, option: u32, value: c_int) !void {
+    if (is_windows) return setsockoptWinsock(fd, level, option, value);
     try posix.setsockopt(fd, level, option, &std.mem.toBytes(value));
+}
+
+/// 0.16's std.posix.setsockopt is `@compileError("use std.Io instead")` on
+/// Windows, and std.Io.net does not speak Winsock at all. aio's sockets ARE
+/// Winsock sockets (WSASocketW, for IOCP), so they are configured through
+/// Winsock. Failures map into posix.SetSockOptError, so callers see the same
+/// error set on every platform.
+fn setsockoptWinsock(fd: posix.socket_t, level: i32, option: u32, value: c_int) posix.SetSockOptError!void {
+    const wincompat = @import("wincompat.zig");
+    const bytes = std.mem.toBytes(value);
+    if (wincompat.setsockopt(fd, level, @intCast(option), &bytes, @intCast(bytes.len)) == 0) return;
+    return switch (wincompat.WSAGetLastError()) {
+        .WSAENOTSOCK => error.FileDescriptorNotASocket,
+        .WSAENOPROTOOPT, .WSAEINVAL => error.InvalidProtocolOption,
+        .WSAEISCONN => error.AlreadyConnected,
+        .WSAENOBUFS => error.SystemResources,
+        .WSAENETDOWN => error.NetworkDown,
+        .WSAEACCES => error.PermissionDenied,
+        else => error.Unexpected,
+    };
 }
