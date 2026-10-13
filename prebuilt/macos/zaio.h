@@ -175,7 +175,10 @@ zaio_status zaio_udp_open(zaio_loop *loop, uint16_t family, uint64_t *out_sock);
  * submitted but not yet run when the socket closes reaches the kernel as EBADF,
  * which aio's kqueue backend treats as unreachable (a trap). On macOS, end
  * pending operations first: shutdown(fd, SHUT_RDWR) on the raw socket, run the
- * loop until their callbacks have run, then call this.
+ * loop until their callbacks have run, then call this. A pending ACCEPT is not
+ * woken that way (shutdown on a listener fails with ENOTCONN): end it with
+ * zaio_loop_cancel_all or zaio_loop_destroy, which run no callback, then
+ * close the listener.
  *
  * Call it from the loop's thread; another thread may call it only while no
  * operation is pending on, or being submitted to, that socket (it touches no
