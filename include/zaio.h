@@ -180,6 +180,10 @@ zaio_status zaio_udp_open(zaio_loop *loop, uint16_t family, uint64_t *out_sock);
  * zaio_loop_cancel_all or zaio_loop_destroy, which run no callback, then
  * close the listener.
  *
+ * Windows: the macOS recipe does not port. shutdown() on the socket does not
+ * complete a recv pending on it (measured: the callback never ran). Close it
+ * with this call, and the recv completes once, as above (measured: ZAIO_CLOSED).
+ *
  * Call it from the loop's thread; another thread may call it only while no
  * operation is pending on, or being submitted to, that socket (it touches no
  * loop state, but the descriptor number can be reused). */
