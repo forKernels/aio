@@ -6,6 +6,13 @@
  * Every export is called at least once. Listening is the consumer's own socket
  * call, as zaio.h says; this file makes it with BSD sockets / Winsock.
  */
+#ifdef __linux__
+/* mkstemp is POSIX.1-2008. glibc declares it only under a POSIX feature macro,
+ * which strict -std=c11 leaves off, so it must come before every include.
+ * Linux only: on Darwin the same macro hides INADDR_LOOPBACK, and Darwin
+ * declares mkstemp without it. */
+#define _POSIX_C_SOURCE 200809L
+#endif
 #include "zaio.h"
 
 #include <stdio.h>
