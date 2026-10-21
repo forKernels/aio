@@ -20,6 +20,8 @@ typedef int os_socklen;
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <stdlib.h> /* mkstemp */
+#include <unistd.h> /* close, unlink */
 typedef int os_socket;
 typedef socklen_t os_socklen;
 #define OS_SHUT_BOTH SHUT_RDWR
@@ -196,12 +198,78 @@ static void test_tcp_loopback(void) {
     CHECK_EQ(zaio_loop_destroy(loop), ZAIO_OK);
 }
 
+static void test_files(void) {
+#ifdef _WIN32
+    /* A file HANDLE here must be opened FILE_FLAG_OVERLAPPED and associated
+     * with the loop's IOCP. The winX86 delivery runs this half on Windows. */
+    printf("zaio C-ABI: file tests are POSIX-only in this build\n");
+#else
+    char path[] = "/tmp/zaio_test_XXXXXX";
+    int fd = mkstemp(path);
+    CHECK(fd >= 0);
+    if (fd < 0) return;
+    zaio_loop *loop = NULL;
+    CHECK_EQ(zaio_loop_create(NULL, &loop), ZAIO_OK);
+    zaio_completion c;
+    const uint8_t msg[] = "zaio file round trip";
+
+    seen w = { 0, ZAIO_PENDING, 0 };
+    CHECK_EQ(zaio_write(loop, (uint64_t)fd, msg, sizeof msg, 0, &c, on_op, &w), ZAIO_PENDING);
+    CHECK(run_until(loop, &w));
+    CHECK_EQ(w.status, ZAIO_OK);
+    CHECK_EQ(w.value, sizeof msg);
+
+    seen f = { 0, ZAIO_PENDING, 0 };
+    CHECK_EQ(zaio_fsync(loop, (uint64_t)fd, &c, on_op, &f), ZAIO_PENDING);
+    CHECK(run_until(loop, &f));
+    CHECK_EQ(f.status, ZAIO_OK);
+
+    uint8_t back[sizeof msg] = { 0 };
+    seen r = { 0, ZAIO_PENDING, 0 };
+    CHECK_EQ(zaio_read(loop, (uint64_t)fd, back, sizeof back, 0, &c, on_op, &r), ZAIO_PENDING);
+    CHECK(run_until(loop, &r));
+    CHECK_EQ(r.status, ZAIO_OK);
+    CHECK_EQ(r.value, sizeof msg);
+    CHECK(memcmp(back, msg, sizeof msg) == 0);
+
+    /* Reading at the end of the file moves 0 bytes. */
+    seen eof = { 0, ZAIO_PENDING, 0 };
+    CHECK_EQ(zaio_read(loop, (uint64_t)fd, back, sizeof back, sizeof msg, &c, on_op, &eof), ZAIO_PENDING);
+    CHECK(run_until(loop, &eof));
+    CHECK_EQ(eof.status, ZAIO_OK);
+    CHECK_EQ(eof.value, 0);
+
+    seen k = { 0, ZAIO_PENDING, 0 };
+    CHECK_EQ(zaio_close(loop, (uint64_t)fd, &c, on_op, &k), ZAIO_PENDING);
+    CHECK(run_until(loop, &k));
+    CHECK_EQ(k.status, ZAIO_OK);
+    unlink(path);
+
+    /* Bad arguments are refused before anything is submitted. */
+    CHECK_EQ(zaio_read(loop, ZAIO_INVALID_SOCKET, back, 1, 0, &c, on_op, &r), ZAIO_INVALID);
+    CHECK_EQ(zaio_write(loop, 3, NULL, 1, 0, &c, on_op, &w), ZAIO_INVALID);
+    CHECK_EQ(zaio_fsync(loop, 3, &c, NULL, &f), ZAIO_INVALID);
+    CHECK_EQ(zaio_close(NULL, 3, &c, on_op, &k), ZAIO_INVALID);
+
+    uint64_t dir = 0;
+    CHECK_EQ(zaio_open_dir("/tmp", 4, &dir), ZAIO_OK);
+    CHECK(dir != ZAIO_INVALID_SOCKET);
+    if (dir != ZAIO_INVALID_SOCKET) close((int)dir);
+    CHECK_EQ(zaio_open_dir("/no/such/dir", 12, &dir), ZAIO_SYSTEM); /* FileNotFound */
+    CHECK_EQ(dir, ZAIO_INVALID_SOCKET);
+    CHECK_EQ(zaio_open_dir(NULL, 0, &dir), ZAIO_INVALID);
+    CHECK_EQ(zaio_open_dir("/tmp", 4, NULL), ZAIO_INVALID);
+    CHECK_EQ(zaio_loop_destroy(loop), ZAIO_OK);
+#endif
+}
+
 int main(void) {
     test_layout();
     test_loop();
     test_timeout_and_cancel();
     test_udp();
     test_tcp_loopback();
+    test_files();
     printf("zaio C-ABI: %d checks, %d failed\n", g_checks, g_failed);
     return g_failed ? 1 : 0;
 }

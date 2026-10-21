@@ -359,6 +359,29 @@ const error_status = [_]struct { []const u8, ZaioStatus }{
     .{ "SocketCreateFailed", .system },
     .{ "FastOpenAlreadyInProgress", .system },
     .{ "FileNotFound", .system },
+    // File operations (zaio_read/write/fsync/close/open_dir). The status set is
+    // forIO's FIO_NET_* one for one, so file errors map onto it rather than
+    // adding codes, as FileNotFound above already does.
+    .{ "InputOutput", .system },
+    .{ "DeviceBusy", .system },
+    .{ "PipeBusy", .system },
+    .{ "AntivirusInterference", .system },
+    .{ "NoSpaceLeft", .resources },
+    .{ "DiskQuota", .resources },
+    .{ "FileTooBig", .resources },
+    .{ "ReadOnlyFileSystem", .access_denied },
+    .{ "FileLocksUnsupported", .unsupported },
+    .{ "IsDir", .invalid },
+    .{ "NotDir", .invalid },
+    .{ "NameTooLong", .invalid },
+    .{ "BadPathName", .invalid },
+    .{ "SymLinkLoop", .invalid },
+    .{ "PathAlreadyExists", .invalid },
+    .{ "NetworkNotFound", .invalid },
+    .{ "Alignment", .invalid },
+    .{ "Unseekable", .invalid },
+    .{ "InvalidWtf8", .invalid }, // Windows open_dir: a path that is not WTF-8
+    .{ "NotConnected", .not_connected }, // write on a socket fd (Linux, Windows)
     .{ "NetworkDown", .system },
     .{ "NetworkSubsystemFailed", .system },
     .{ "NoDevice", .system },
@@ -658,6 +681,102 @@ pub export fn zaio_timeout(handle: ?*ZaioLoop, timeout_ns: u64, completion: ?*Za
     };
     p.loop.io.timeout(*Slot, p.slot, onTimeout, &p.slot.io_completion, ns);
     return .pending;
+}
+
+// =============================================================================
+// Files
+// =============================================================================
+// fd is the OS file descriptor (a HANDLE on Windows), carried in u64 exactly as
+// sockets are. Same contract as recv/send: ZAIO_PENDING, then the callback runs
+// once with ZAIO_OK and the bytes moved (read/write) or 0 (fsync/close).
+
+const fd_is_handle = @typeInfo(IO.fd_t) == .pointer;
+
+fn toFd(v: u64) ?IO.fd_t {
+    if (v == invalid_socket) return null;
+    if (fd_is_handle) {
+        if (v == 0) return null;
+        return @ptrFromInt(std.math.cast(usize, v) orelse return null);
+    }
+    return std.math.cast(IO.fd_t, v);
+}
+
+fn fromFd(f: IO.fd_t) u64 {
+    if (fd_is_handle) return @intFromPtr(f);
+    return if (f < 0) invalid_socket else @intCast(f);
+}
+
+fn onRead(slot: *Slot, _: *IO.Completion, result: IO.ReadError!usize) void {
+    const n = result catch |err| return deliver(slot, statusOf(err), 0);
+    deliver(slot, .ok, n);
+}
+
+fn onWrite(slot: *Slot, _: *IO.Completion, result: IO.WriteError!usize) void {
+    const n = result catch |err| return deliver(slot, statusOf(err), 0);
+    deliver(slot, .ok, n);
+}
+
+fn onFsync(slot: *Slot, _: *IO.Completion, result: IO.FsyncError!void) void {
+    result catch |err| return deliver(slot, statusOf(err), 0);
+    deliver(slot, .ok, 0);
+}
+
+fn onClose(slot: *Slot, _: *IO.Completion, result: IO.CloseError!void) void {
+    result catch |err| return deliver(slot, statusOf(err), 0);
+    deliver(slot, .ok, 0);
+}
+
+pub export fn zaio_read(handle: ?*ZaioLoop, fd: u64, buf: ?[*]u8, len: usize, offset: u64, completion: ?*ZaioCompletion, callback: ?ZaioCallback, user: ?*anyopaque) callconv(.c) ZaioStatus {
+    const f = toFd(fd) orelse return .invalid;
+    const b = buf orelse return .invalid;
+    const p = switch (prepare(handle, completion, callback, user)) {
+        .ready => |r| r,
+        .failed => |status| return status,
+    };
+    p.loop.io.read(*Slot, p.slot, onRead, &p.slot.io_completion, f, b[0..@min(len, max_transfer)], offset);
+    return .pending;
+}
+
+pub export fn zaio_write(handle: ?*ZaioLoop, fd: u64, buf: ?[*]const u8, len: usize, offset: u64, completion: ?*ZaioCompletion, callback: ?ZaioCallback, user: ?*anyopaque) callconv(.c) ZaioStatus {
+    const f = toFd(fd) orelse return .invalid;
+    const b = buf orelse return .invalid;
+    const p = switch (prepare(handle, completion, callback, user)) {
+        .ready => |r| r,
+        .failed => |status| return status,
+    };
+    p.loop.io.write(*Slot, p.slot, onWrite, &p.slot.io_completion, f, b[0..@min(len, max_transfer)], offset);
+    return .pending;
+}
+
+pub export fn zaio_fsync(handle: ?*ZaioLoop, fd: u64, completion: ?*ZaioCompletion, callback: ?ZaioCallback, user: ?*anyopaque) callconv(.c) ZaioStatus {
+    const f = toFd(fd) orelse return .invalid;
+    const p = switch (prepare(handle, completion, callback, user)) {
+        .ready => |r| r,
+        .failed => |status| return status,
+    };
+    p.loop.io.fsync(*Slot, p.slot, onFsync, &p.slot.io_completion, f);
+    return .pending;
+}
+
+pub export fn zaio_close(handle: ?*ZaioLoop, fd: u64, completion: ?*ZaioCompletion, callback: ?ZaioCallback, user: ?*anyopaque) callconv(.c) ZaioStatus {
+    const f = toFd(fd) orelse return .invalid;
+    const p = switch (prepare(handle, completion, callback, user)) {
+        .ready => |r| r,
+        .failed => |status| return status,
+    };
+    p.loop.io.close(*Slot, p.slot, onClose, &p.slot.io_completion, f);
+    return .pending;
+}
+
+/// Synchronous, like IO.open_dir: opens a directory for fsync-ing its entries.
+/// path is not NUL-terminated; path_len bytes are used.
+pub export fn zaio_open_dir(path: ?[*]const u8, path_len: usize, out_fd: ?*u64) callconv(.c) ZaioStatus {
+    const out = out_fd orelse return .invalid;
+    out.* = invalid_socket;
+    const p = path orelse return .invalid;
+    const f = IO.open_dir(p[0..path_len]) catch |err| return statusOf(err);
+    out.* = fromFd(f);
+    return .ok;
 }
 
 // =============================================================================
