@@ -187,36 +187,35 @@ static void test_tcp_loopback(void) {
     CHECK_EQ(now, 0);
 #endif
 
-    /* End a pending recv the portable way: shut the socket down, run the loop
-     * until the recv reports end of stream, then close (zaio.h: kqueue strands
-     * an operation whose socket is closed under it). */
+    /* End a pending recv the way zaio.h gives for each backend. kqueue strands
+     * an operation whose socket is closed under it, so POSIX shuts the socket
+     * down, runs the loop until the recv reports end of stream, then closes.
+     * Winsock does not complete a pending overlapped recv when its own socket
+     * is shut down (measured: the recv never ran), so Windows closes the
+     * socket, which IOCP reports to the recv once. */
     seen orphan = { 0, ZAIO_PENDING, 0 };
     CHECK_EQ(zaio_recv(loop, server, in, sizeof in, &cr, on_op, &orphan), ZAIO_PENDING);
     CHECK_EQ(zaio_loop_run_for(loop, 30u * 1000u * 1000u), ZAIO_OK);
     CHECK_EQ(orphan.calls, 0);
+#ifdef _WIN32
+    CHECK_EQ(zaio_socket_close(loop, server), ZAIO_OK);
+    CHECK(run_until(loop, &orphan));
+    CHECK(orphan.status == ZAIO_CLOSED || (orphan.status == ZAIO_OK && orphan.value == 0));
+#else
     CHECK_EQ(shutdown((os_socket)server, OS_SHUT_BOTH), 0);
     CHECK(run_until(loop, &orphan));
     CHECK(orphan.status == ZAIO_CLOSED || (orphan.status == ZAIO_OK && orphan.value == 0));
-
     CHECK_EQ(zaio_socket_close(loop, server), ZAIO_OK);
+#endif
+
     CHECK_EQ(zaio_socket_close(loop, client), ZAIO_OK);
     CHECK_EQ(zaio_socket_close(loop, listener), ZAIO_OK);
     CHECK_EQ(zaio_socket_close(loop, ZAIO_INVALID_SOCKET), ZAIO_INVALID);
     CHECK_EQ(zaio_loop_destroy(loop), ZAIO_OK);
 }
 
-static void test_files(void) {
-#ifdef _WIN32
-    /* A file HANDLE here must be opened FILE_FLAG_OVERLAPPED and associated
-     * with the loop's IOCP. The winX86 delivery runs this half on Windows. */
-    printf("zaio C-ABI: file tests are POSIX-only in this build\n");
-#else
-    char path[] = "/tmp/zaio_test_XXXXXX";
-    int fd = mkstemp(path);
-    CHECK(fd >= 0);
-    if (fd < 0) return;
-    zaio_loop *loop = NULL;
-    CHECK_EQ(zaio_loop_create(NULL, &loop), ZAIO_OK);
+/* Write, fsync, read back, read at the end, close: one file, through the loop. */
+static void file_round_trip(zaio_loop *loop, uint64_t fd) {
     zaio_completion c;
     const uint8_t msg[] = "zaio file round trip";
 
@@ -250,24 +249,61 @@ static void test_files(void) {
     CHECK_EQ(zaio_close(loop, (uint64_t)fd, &c, on_op, &k), ZAIO_PENDING);
     CHECK(run_until(loop, &k));
     CHECK_EQ(k.status, ZAIO_OK);
+}
+
+static void test_files(void) {
+    zaio_loop *loop = NULL;
+    CHECK_EQ(zaio_loop_create(NULL, &loop), ZAIO_OK);
+#ifdef _WIN32
+    char tmp[MAX_PATH], path[MAX_PATH];
+    DWORD tmp_len = GetTempPathA(sizeof tmp, tmp);
+    CHECK(tmp_len > 0 && tmp_len < sizeof tmp);
+    /* aio never binds a file HANDLE to its port (src/io/windows.zig, FILE I/O):
+     * forIO's handles are opened without FILE_FLAG_OVERLAPPED, and one opened
+     * with it is finished by GetOverlappedResult. Both kinds go round trip. */
+    const DWORD open_flags[2] = { FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OVERLAPPED };
+    for (int i = 0; i < 2; i++) {
+        CHECK(GetTempFileNameA(tmp, "zio", 0, path) != 0);
+        HANDLE h = CreateFileA(path, GENERIC_READ | GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, open_flags[i], NULL);
+        CHECK(h != INVALID_HANDLE_VALUE);
+        if (h != INVALID_HANDLE_VALUE) file_round_trip(loop, (uint64_t)(uintptr_t)h);
+        DeleteFileA(path);
+    }
+#else
+    char path[] = "/tmp/zaio_test_XXXXXX";
+    int fd = mkstemp(path);
+    CHECK(fd >= 0);
+    if (fd >= 0) file_round_trip(loop, (uint64_t)fd);
     unlink(path);
+#endif
 
     /* Bad arguments are refused before anything is submitted. */
+    zaio_completion c;
+    uint8_t back[1];
+    seen r = { 0, ZAIO_PENDING, 0 }, w = r, f = r, k = r;
     CHECK_EQ(zaio_read(loop, ZAIO_INVALID_SOCKET, back, 1, 0, &c, on_op, &r), ZAIO_INVALID);
     CHECK_EQ(zaio_write(loop, 3, NULL, 1, 0, &c, on_op, &w), ZAIO_INVALID);
     CHECK_EQ(zaio_fsync(loop, 3, &c, NULL, &f), ZAIO_INVALID);
     CHECK_EQ(zaio_close(NULL, 3, &c, on_op, &k), ZAIO_INVALID);
 
     uint64_t dir = 0;
+#ifdef _WIN32
+    CHECK_EQ(zaio_open_dir(tmp, tmp_len, &dir), ZAIO_OK);
+    CHECK(dir != ZAIO_INVALID_SOCKET);
+    if (dir != ZAIO_INVALID_SOCKET) CloseHandle((HANDLE)(uintptr_t)dir);
+    CHECK_EQ(zaio_open_dir("C:\\no\\such\\dir", 14, &dir), ZAIO_SYSTEM); /* FileNotFound */
+    CHECK_EQ(dir, ZAIO_INVALID_SOCKET);
+    CHECK_EQ(zaio_open_dir(tmp, tmp_len, NULL), ZAIO_INVALID);
+#else
     CHECK_EQ(zaio_open_dir("/tmp", 4, &dir), ZAIO_OK);
     CHECK(dir != ZAIO_INVALID_SOCKET);
     if (dir != ZAIO_INVALID_SOCKET) close((int)dir);
     CHECK_EQ(zaio_open_dir("/no/such/dir", 12, &dir), ZAIO_SYSTEM); /* FileNotFound */
     CHECK_EQ(dir, ZAIO_INVALID_SOCKET);
-    CHECK_EQ(zaio_open_dir(NULL, 0, &dir), ZAIO_INVALID);
     CHECK_EQ(zaio_open_dir("/tmp", 4, NULL), ZAIO_INVALID);
-    CHECK_EQ(zaio_loop_destroy(loop), ZAIO_OK);
 #endif
+    CHECK_EQ(zaio_open_dir(NULL, 0, &dir), ZAIO_INVALID);
+    CHECK_EQ(zaio_loop_destroy(loop), ZAIO_OK);
 }
 
 int main(void) {
