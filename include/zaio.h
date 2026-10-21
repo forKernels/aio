@@ -212,6 +212,31 @@ zaio_status zaio_send_now(zaio_loop *loop, uint64_t sock, const uint8_t *buf, si
 zaio_status zaio_timeout(zaio_loop *loop, uint64_t timeout_ns,
                          zaio_completion *completion, zaio_callback callback, void *user);
 
+/* ---- Files ----------------------------------------------------------------- */
+/* fd is the OS file descriptor (a HANDLE on Windows) carried in uint64_t, as
+ * sockets are; ZAIO_INVALID_SOCKET is never a valid fd. The async calls return
+ * ZAIO_PENDING and the callback runs once: value = bytes moved for read and
+ * write (0 from read = end of file), 0 for fsync and close. File errors use
+ * the same statuses as sockets: disk full or quota -> ZAIO_RESOURCES, I/O
+ * error -> ZAIO_SYSTEM, a bad path or a directory where a file belongs ->
+ * ZAIO_INVALID, read-only filesystem -> ZAIO_ACCESS_DENIED. On macOS a write
+ * is followed by F_FULLFSYNC before the callback runs. */
+zaio_status zaio_read(zaio_loop *loop, uint64_t fd, uint8_t *buf, size_t len, uint64_t offset,
+                      zaio_completion *completion, zaio_callback callback, void *user);
+zaio_status zaio_write(zaio_loop *loop, uint64_t fd, const uint8_t *buf, size_t len,
+                       uint64_t offset, zaio_completion *completion, zaio_callback callback,
+                       void *user);
+zaio_status zaio_fsync(zaio_loop *loop, uint64_t fd,
+                       zaio_completion *completion, zaio_callback callback, void *user);
+/* Closes a FILE fd; sockets keep zaio_socket_close. */
+zaio_status zaio_close(zaio_loop *loop, uint64_t fd,
+                       zaio_completion *completion, zaio_callback callback, void *user);
+
+/* Synchronous. Opens a directory read-only so its entries can be fsync'd.
+ * path is path_len bytes, not NUL-terminated. *out_fd = ZAIO_INVALID_SOCKET
+ * on failure. */
+zaio_status zaio_open_dir(const char *path, size_t path_len, uint64_t *out_fd);
+
 #if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
 _Static_assert(sizeof(zaio_completion) == 512, "zaio_completion is 512 bytes");
 _Static_assert(sizeof(zaio_sock_addr) == 32, "zaio_sock_addr is 32 bytes");

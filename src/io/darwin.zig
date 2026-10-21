@@ -309,6 +309,15 @@ pub const IO = struct {
         },
     };
 
+    /// Whether an operation's result type (E!T) can carry error.WouldBlock.
+    fn canWouldBlock(comptime R: type) bool {
+        const set = @typeInfo(@typeInfo(R).error_union.error_set).error_set orelse return true;
+        for (set) |e| {
+            if (std.mem.eql(u8, e.name, "WouldBlock")) return true;
+        }
+        return false;
+    }
+
     fn submit(
         self: *IO,
         context: anytype,
@@ -326,17 +335,23 @@ pub const IO = struct {
                 const op_data = &@field(_completion.operation, @tagName(operation_tag));
                 const result = OperationImpl.do_operation(op_data);
 
-                // Requeue onto io_pending if error.WouldBlock.
+                // Requeue onto io_pending if error.WouldBlock. Only an
+                // operation whose error set has WouldBlock can report it: on
+                // Zig 0.16 posix.PWriteError has none (a regular-file pwrite
+                // never returns EAGAIN), and a switch prong for an error the
+                // set lacks does not compile, so write is checked, not listed.
                 switch (operation_tag) {
                     .accept, .connect, .read, .write, .send, .recv => {
-                        _ = result catch |err| switch (err) {
-                            error.WouldBlock => {
-                                _completion.link = .{};
-                                io.io_pending.push(_completion);
-                                return;
-                            },
-                            else => {},
-                        };
+                        if (comptime canWouldBlock(@TypeOf(result))) {
+                            _ = result catch |err| switch (err) {
+                                error.WouldBlock => {
+                                    _completion.link = .{};
+                                    io.io_pending.push(_completion);
+                                    return;
+                                },
+                                else => {},
+                            };
+                        }
                     },
                     else => {},
                 }
@@ -803,7 +818,12 @@ pub const IO = struct {
                     // below) is _synchronous_, so it's safe to call fs_sync after it has
                     // completed.
                     const result = posix.pwrite(op.fd, op.buf[0..op.len], op.offset);
-                    try fs_sync(op.fd);
+                    // fs_sync's fsync fallback can report Canceled on 0.16, which
+                    // WriteError does not carry; everything else it reports does.
+                    fs_sync(op.fd) catch |err| return switch (err) {
+                        error.Canceled => error.Unexpected,
+                        else => |e| e,
+                    };
 
                     return result;
                 }

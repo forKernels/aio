@@ -497,7 +497,6 @@ pub fn open(file_path: []const u8, flags: O, perm: mode_t) OpenError!fd_t {
             .NFILE => return error.SystemFdQuotaExceeded,
             .NODEV => return error.NoDevice,
             .NOENT => return error.FileNotFound,
-            .SRCH => return error.ProcessNotFound,
             .NOMEM => return error.SystemResources,
             .NOSPC => return error.NoSpaceLeft,
             .NOTDIR => return error.NotDir,

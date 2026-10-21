@@ -1589,7 +1589,8 @@ pub const IO = struct {
 
     /// Opens a directory with read only access.
     pub fn open_dir(dir_path: []const u8) !fd_t {
-        return posix.open(dir_path, .{ .CLOEXEC = true, .ACCMODE = .RDONLY }, 0);
+        // 0.16 removed posix.open; openat at AT.FDCWD is the same call.
+        return posix.openat(posix.AT.FDCWD, dir_path, .{ .CLOEXEC = true, .ACCMODE = .RDONLY }, 0);
     }
 
     pub const fd_t = posix.fd_t;
