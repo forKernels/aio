@@ -27,7 +27,7 @@ pub fn build(b: *std.Build) void {
         std.builtin.OptimizeMode,
         "optimize",
         "Prioritize performance, safety, or binary size (delivery default: ReleaseSafe)",
-    ) orelse .ReleaseSafe;
+    ) orelse std.builtin.OptimizeMode.ReleaseSafe;
 
     // Reflective type construction, selected BY COMPILER VERSION.
     //
