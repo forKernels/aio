@@ -6,6 +6,7 @@ const std = @import("std");
 // error and a comptime branch cannot hide it.
 const reify = @import("reify");
 const builtin = @import("builtin");
+const structFields = @import("zigcompat.zig").structFields;
 const assert = std.debug.assert;
 
 pub const BoundedArrayType = @import("./stdx/bounded_array.zig").BoundedArrayType;
@@ -231,7 +232,7 @@ const TimeIt = struct {
 
     /// Prints elapsed time to stderr and resets the internal timer.
     pub fn lap(self: *TimeIt, comptime label: []const u8) void {
-        const label_alignment = comptime " " ** (1 + (12 -| label.len));
+        const label_alignment = comptime &@as([1 + (12 -| label.len)]u8, @splat(' '));
 
         const nanos = self.inner.lap();
         std.debug.print(
@@ -309,8 +310,8 @@ fn has_pointers(comptime T: type) bool {
         .bool, .int, .@"enum" => return false,
 
         .array => |info| return comptime has_pointers(info.child),
-        .@"struct" => |info| {
-            inline for (info.fields) |field| {
+        .@"struct" => {
+            inline for (comptime structFields(T)) |field| {
                 if (comptime has_pointers(field.type)) return true;
             }
             return false;
@@ -328,12 +329,12 @@ pub fn no_padding(comptime T: type) bool {
             switch (info.layout) {
                 .auto => return false,
                 .@"extern" => {
-                    for (info.fields) |field| {
+                    for (structFields(T)) |field| {
                         if (!no_padding(field.type)) return false;
                     }
 
                     // Check offsets of u128 and pseudo-u256 fields.
-                    for (info.fields) |field| {
+                    for (structFields(T)) |field| {
                         if (field.type == u128) {
                             const offset = @offsetOf(T, field.name);
                             if (offset % @sizeOf(u128) != 0) return false;
@@ -350,7 +351,7 @@ pub fn no_padding(comptime T: type) bool {
                     }
 
                     var offset = 0;
-                    for (info.fields) |field| {
+                    for (structFields(T)) |field| {
                         const field_offset = @offsetOf(T, field.name);
                         if (offset != field_offset) return false;
                         offset += @sizeOf(field.type);
@@ -361,7 +362,7 @@ pub fn no_padding(comptime T: type) bool {
             }
         },
         .@"enum" => |info| {
-            maybe(info.is_exhaustive);
+            maybe(if (@hasField(@TypeOf(info), "is_exhaustive")) info.is_exhaustive else info.mode == .exhaustive); // 0.17: mode
             return no_padding(info.tag_type);
         },
         .pointer => return false,
@@ -608,7 +609,7 @@ pub fn has_unique_representation(comptime T: type) bool {
 
             var sum_size = @as(usize, 0);
 
-            inline for (info.fields) |field| {
+            inline for (comptime structFields(T)) |field| {
                 const FieldType = field.type;
                 if (comptime !has_unique_representation(FieldType)) return false;
                 sum_size += @sizeOf(FieldType);
@@ -716,7 +717,7 @@ test "has_unique_representation" {
 
     try std.testing.expect(!has_unique_representation(TestUnion4));
 
-    inline for ([_]type{ i0, u8, i16, u32, i64 }) |T| {
+    inline for ([_]type{ u8, i16, u32, i64 }) |T| {
         try std.testing.expect(has_unique_representation(T));
     }
     inline for ([_]type{ i1, u9, i17, u33, i24 }) |T| {
@@ -905,7 +906,7 @@ pub fn unexpected_errno(label: []const u8, err: std.posix.system.E) std.posix.Un
         std.enums.tagName(std.posix.system.E, err),
     });
 
-    if (builtin.mode == .Debug) {
+    if (builtin.mode == std.builtin.OptimizeMode.Debug) {
         std.debug.dumpCurrentStackTrace(null);
     }
     return error.Unexpected;

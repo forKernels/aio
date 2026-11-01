@@ -47,6 +47,7 @@ const builtin = @import("builtin");
 
 const IO = @import("io.zig").IO;
 const Address = @import("zigcompat.zig").Address;
+const errorNames = @import("zigcompat.zig").errorNames;
 const posix = std.posix;
 
 const is_linux = builtin.os.tag == .linux;
@@ -402,18 +403,18 @@ fn statusNamed(comptime name: []const u8) ?ZaioStatus {
 
 fn statusOf(err: anytype) ZaioStatus {
     const E = @TypeOf(err);
-    const members = @typeInfo(E).error_set orelse
+    const members = comptime errorNames(E) orelse
         @compileError("aio c_abi: statusOf needs a concrete error set, not anyerror");
     comptime {
         var missing: []const u8 = "";
         for (members) |m| {
-            if (statusNamed(m.name) == null) missing = missing ++ " error." ++ m.name;
+            if (statusNamed(m) == null) missing = missing ++ " error." ++ m;
         }
         if (missing.len != 0) @compileError("aio c_abi: " ++ @typeName(E) ++ " can report" ++
             missing ++ ", with no zaio status. Add each to error_status in src/c_abi.zig.");
     }
     inline for (members) |m| {
-        if (err == @field(anyerror, m.name)) return comptime statusNamed(m.name).?;
+        if (err == @field(anyerror, m)) return comptime statusNamed(m).?;
     }
     // `err` is a member of E and the loop returned for every member of E.
     unreachable;

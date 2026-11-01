@@ -490,7 +490,9 @@ pub const IO = struct {
         operation: Completion.Operation,
         comptime OperationImpl: type,
     ) void {
-        const Result = @typeInfo(@TypeOf(callback)).@"fn".params[2].type.?;
+        const cb_fn = @typeInfo(@TypeOf(callback)).@"fn";
+        // 0.17 split .params into parallel param_types/param_attrs slices.
+        const Result = if (@hasField(@TypeOf(cb_fn), "param_types")) cb_fn.param_types[2].? else cb_fn.params[2].type.?;
         const ErrorSet = @typeInfo(Result).error_union.error_set;
 
         const Callback = struct {
