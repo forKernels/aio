@@ -14,6 +14,7 @@ const common = @import("./common.zig");
 // std.net was removed outright in 0.16, not renamed. zigcompat.Address is the
 // sockaddr carrier aio supplies in its place, and is std.net.Address on 0.15.2.
 const Address = @import("../zigcompat.zig").Address;
+const errorNames = @import("../zigcompat.zig").errorNames;
 const QueueType = @import("../queue.zig").QueueType;
 const Time = @import("../time.zig").Time;
 const buffer_limit = @import("../io.zig").buffer_limit;
@@ -311,9 +312,9 @@ pub const IO = struct {
 
     /// Whether an operation's result type (E!T) can carry error.WouldBlock.
     fn canWouldBlock(comptime R: type) bool {
-        const set = @typeInfo(@typeInfo(R).error_union.error_set).error_set orelse return true;
+        const set = errorNames(@typeInfo(R).error_union.error_set) orelse return true;
         for (set) |e| {
-            if (std.mem.eql(u8, e.name, "WouldBlock")) return true;
+            if (std.mem.eql(u8, e, "WouldBlock")) return true;
         }
         return false;
     }

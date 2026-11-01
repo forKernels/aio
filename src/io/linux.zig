@@ -76,26 +76,30 @@ pub const IO = struct {
             @panic("Linux kernel 5.5 or greater is required for io_uring OP_ACCEPT");
         }
 
-        // Before the errdefer below, whose switch names only io_uring's errors.
+        // Before the catch below, whose switch names only io_uring's errors.
         const wake_rc = linux.eventfd(0, linux.EFD.CLOEXEC);
         if (linux.errno(wake_rc) != .SUCCESS) return error.SystemResources;
         const wake_fd: posix.fd_t = @intCast(wake_rc);
         errdefer _ = linux.close(wake_fd);
 
-        errdefer |err| switch (err) {
-            error.SystemOutdated => {
-                log.err("io_uring is not available", .{});
-                log.err("likely cause: the syscall is disabled by seccomp", .{});
-            },
-            error.PermissionDenied => {
-                log.err("io_uring is not available", .{});
-                log.err("likely cause: the syscall is disabled by sysctl, " ++
-                    "try 'sysctl -w kernel.io_uring_disabled=0'", .{});
-            },
-            else => {},
+        // 0.17 removed `errdefer |err|`; a catch logs the same errors on both.
+        const ring = IO_Uring.init(entries, flags) catch |err| {
+            switch (err) {
+                error.SystemOutdated => {
+                    log.err("io_uring is not available", .{});
+                    log.err("likely cause: the syscall is disabled by seccomp", .{});
+                },
+                error.PermissionDenied => {
+                    log.err("io_uring is not available", .{});
+                    log.err("likely cause: the syscall is disabled by sysctl, " ++
+                        "try 'sysctl -w kernel.io_uring_disabled=0'", .{});
+                },
+                else => {},
+            }
+            return err;
         };
 
-        return IO{ .ring = try IO_Uring.init(entries, flags), .wake_fd = wake_fd };
+        return IO{ .ring = ring, .wake_fd = wake_fd };
     }
 
     pub fn deinit(self: *IO) void {
@@ -1808,7 +1812,7 @@ pub const IO = struct {
                         "of the file instead...", .{});
 
                     const sector_size = constants.sector_size;
-                    const sector: [sector_size]u8 align(sector_size) = [_]u8{0} ** sector_size;
+                    const sector: [sector_size]u8 align(sector_size) = @splat(0);
 
                     // Handle partial writes where the physical sector is
                     // less than a logical sector:
@@ -1925,7 +1929,7 @@ pub const IO = struct {
     fn fs_supports_direct_io(dir_fd: fd_t) !bool {
         if (!@hasField(posix.O, "DIRECT")) return false;
 
-        var cookie: [16]u8 = .{'0'} ** 16;
+        var cookie: [16]u8 = @splat('0');
         _ = stdx.array_print(16, &cookie, "{0x}", .{std.crypto.random.int(u64)});
 
         const path: [:0]const u8 = "fs_supports_direct_io-" ++ cookie ++ "";
