@@ -471,21 +471,6 @@ inline fn low_level_hash(seed: u64, input: anytype) u64 {
 //     }
 // }
 
-/// Returns a copy of `base` with fields changed according to `diff`.
-///
-/// Intended exclusively for table-driven prototype-based tests. Write
-/// updates explicitly in production code.
-pub fn update(base: anytype, diff: anytype) @TypeOf(base) {
-    assert(builtin.is_test);
-    assert(@typeInfo(@TypeOf(base)) == .@"struct");
-
-    var updated = base;
-    inline for (std.meta.fields(@TypeOf(diff))) |f| {
-        @field(updated, f.name) = @field(diff, f.name);
-    }
-    return updated;
-}
-
 // std.SemanticVersion requires there be no extra characters after the
 // major/minor/patch numbers. But when we try to parse `uname
 // --kernel-release` (note: while Linux doesn't follow semantic
@@ -717,6 +702,10 @@ test "has_unique_representation" {
 
     try std.testing.expect(!has_unique_representation(TestUnion4));
 
+    // 0.17 has no zero-bit signed integer (`i0` no longer parses); 0.16 still checks it.
+    if (comptime builtin.zig_version.order(.{ .major = 0, .minor = 17, .patch = 0 }) == .lt) {
+        try std.testing.expect(has_unique_representation(@Int(.signed, 0)));
+    }
     inline for ([_]type{ u8, i16, u32, i64 }) |T| {
         try std.testing.expect(has_unique_representation(T));
     }
@@ -728,34 +717,6 @@ test "has_unique_representation" {
     try std.testing.expect(!has_unique_representation([]const u8));
 
     try std.testing.expect(has_unique_representation(@Vector(4, u16)));
-}
-
-/// Construct a `union(Enum)` type, where each union "value" type is defined in terms of the
-/// variant.
-///
-/// That is, `EnumUnionType(Enum, TypeForVariant)` is equivalent to:
-///
-///   union(Enum) {
-///     // For every `e` in `Enum`:
-///     e: TypeForVariant(e),
-///   }
-///
-pub fn EnumUnionType(
-    comptime Enum: type,
-    comptime TypeForVariant: fn (comptime variant: Enum) type,
-) type {
-    const UnionField = std.builtin.Type.UnionField;
-
-    var fields: []const UnionField = &[_]UnionField{};
-    for (std.enums.values(Enum)) |enum_variant| {
-        fields = fields ++ &[_]UnionField{.{
-            .name = @tagName(enum_variant),
-            .type = TypeForVariant(enum_variant),
-            .alignment = @alignOf(TypeForVariant(enum_variant)),
-        }};
-    }
-
-    return reify.Union(Enum, fields);
 }
 
 /// Creates a slice to a comptime slice without triggering
@@ -828,7 +789,7 @@ pub fn array_print(
 
     comptime {
         var args_worst_case: Args = undefined;
-        for (ArgsStruct.fields, 0..) |field, index| {
+        for (structFields(Args), 0..) |field, index| {
             const arg_worst_case = switch (field.type) {
                 u64 => std.math.maxInt(field.type),
                 else => @compileError("array_print: unhandled type"),
@@ -842,6 +803,13 @@ pub fn array_print(
     return std.fmt.bufPrint(buffer, fmt, args) catch |err| switch (err) {
         error.NoSpaceLeft => unreachable,
     };
+}
+
+test array_print {
+    var buffer: [16]u8 = undefined;
+    var value: u64 = 255; // runtime, as callers pass it: a comptime tuple field cannot be probed
+    _ = &value;
+    try std.testing.expectEqualStrings("ff", array_print(16, &buffer, "{x}", .{value}));
 }
 
 // DateTime in UTC, intended primarily for logging.
