@@ -11,7 +11,7 @@ const log = std.log.scoped(.io);
 const constants = @import("../constants.zig");
 const stdx = @import("../stdx.zig");
 const common = @import("./common.zig");
-const Address = std.net.Address;
+const Address = @import("../zigcompat.zig").Address;
 const QueueType = @import("../queue.zig").QueueType;
 const buffer_limit = @import("../io.zig").buffer_limit;
 const DirectIO = @import("../io.zig").DirectIO;
@@ -60,6 +60,14 @@ pub const IO = struct {
         done,
     } = .inactive,
 
+    /// wake(): an eventfd, with a read kept armed on the ring by run_for_ns().
+    wake_fd: posix.fd_t = -1,
+    wake_armed: bool = false,
+    wake_buffer: u64 = 0,
+    wake_completion: Completion = undefined,
+    /// Set by wake(), consumed by run_for_ns().
+    woken: std.atomic.Value(bool) = .init(false),
+
     pub fn init(entries: u12, flags: u32) !IO {
         // Detect the linux version to ensure that we support all io_uring ops used.
         const uts = posix.uname();
@@ -68,24 +76,36 @@ pub const IO = struct {
             @panic("Linux kernel 5.5 or greater is required for io_uring OP_ACCEPT");
         }
 
-        errdefer |err| switch (err) {
-            error.SystemOutdated => {
-                log.err("io_uring is not available", .{});
-                log.err("likely cause: the syscall is disabled by seccomp", .{});
-            },
-            error.PermissionDenied => {
-                log.err("io_uring is not available", .{});
-                log.err("likely cause: the syscall is disabled by sysctl, " ++
-                    "try 'sysctl -w kernel.io_uring_disabled=0'", .{});
-            },
-            else => {},
+        // Before the catch below, whose switch names only io_uring's errors.
+        const wake_rc = linux.eventfd(0, linux.EFD.CLOEXEC);
+        if (linux.errno(wake_rc) != .SUCCESS) return error.SystemResources;
+        const wake_fd: posix.fd_t = @intCast(wake_rc);
+        errdefer _ = linux.close(wake_fd);
+
+        // 0.17 removed `errdefer |err|`; a catch logs the same errors on both.
+        const ring = IO_Uring.init(entries, flags) catch |err| {
+            switch (err) {
+                error.SystemOutdated => {
+                    log.err("io_uring is not available", .{});
+                    log.err("likely cause: the syscall is disabled by seccomp", .{});
+                },
+                error.PermissionDenied => {
+                    log.err("io_uring is not available", .{});
+                    log.err("likely cause: the syscall is disabled by sysctl, " ++
+                        "try 'sysctl -w kernel.io_uring_disabled=0'", .{});
+                },
+                else => {},
+            }
+            return err;
         };
 
-        return IO{ .ring = try IO_Uring.init(entries, flags) };
+        return IO{ .ring = ring, .wake_fd = wake_fd };
     }
 
     pub fn deinit(self: *IO) void {
         self.ring.deinit();
+        if (self.wake_fd != -1) _ = linux.close(self.wake_fd);
+        self.wake_fd = -1;
     }
 
     /// Pass all queued submissions to the kernel and peek for completions.
@@ -119,10 +139,18 @@ pub const IO = struct {
     pub fn run_for_ns(self: *IO, nanoseconds: u63) !void {
         assert(self.cancel_status != .done);
 
+        // Keep a read armed on the wake eventfd while the loop can block, so a
+        // wake() from another thread ends the wait below. Not during cancel_all(),
+        // which runs this loop itself and admits no new operation (enqueue()).
+        if (!self.wake_armed and self.cancel_status == .inactive) {
+            self.wake_armed = true;
+            self.read(*IO, self, on_wake_read, &self.wake_completion, self.wake_fd, std.mem.asBytes(&self.wake_buffer), 0);
+        }
+
         // We must use the same clock source used by io_uring (CLOCK_MONOTONIC) since we specify the
         // timeout below as an absolute value. Otherwise, we may deadlock if the clock sources are
         // dramatically different. Any kernel that supports io_uring will support CLOCK_MONOTONIC.
-        const current_ts = posix.clock_gettime(posix.CLOCK.MONOTONIC) catch unreachable;
+        const current_ts = @import("../zigcompat.zig").clockMonotonic();
         // The absolute CLOCK_MONOTONIC time after which we may return from this function:
         const timeout_ts: os.linux.kernel_timespec = .{
             .sec = current_ts.sec,
@@ -131,6 +159,11 @@ pub const IO = struct {
         var timeouts: usize = 0;
         var etime = false;
         while (!etime) {
+            // Woken: take what is ready without waiting, then return.
+            if (self.woken.swap(false, .seq_cst)) {
+                try self.flush(0, &timeouts, &etime);
+                break;
+            }
             const timeout_sqe = self.ring.get_sqe() catch blk: {
                 // The submission queue is full, so flush submissions to make space:
                 try self.flush_submissions(0, &timeouts, &etime);
@@ -147,6 +180,21 @@ pub const IO = struct {
 
             // The amount of time this call will block is bounded by the timeout we just submitted:
             try self.flush(1, &timeouts, &etime);
+        }
+        // A wake() ends the loop above before its absolute timeouts expire. Each
+        // completes at its deadline or once some LATER completion is posted (count
+        // 1), and the reap below busy-waits for them. A wake whose eventfd read
+        // completed before this round's timeout was queued leaves that timeout
+        // with no later completion coming, and the reap would spin a core until
+        // the deadline. So post one: a NOP, tagged 0 and counted like a timeout.
+        if (!etime and timeouts > 0) {
+            _ = self.ring.nop(0) catch blk: {
+                try self.flush_submissions(0, &timeouts, &etime);
+                break :blk self.ring.nop(0) catch unreachable;
+            };
+            timeouts += 1;
+            self.ios_queued += 1;
+            try self.flush_submissions(0, &timeouts, &etime);
         }
         // Reap any remaining timeouts, which reference the timespec in the current stack frame.
         // The busy loop here is required to avoid a potential deadlock, as the kernel determines
@@ -367,6 +415,16 @@ pub const IO = struct {
         assert(completion.operation == .cancel);
         assert(completion.operation.cancel.target == self.cancel_status.queued.target);
 
+        // `target` is read BEFORE the assignment begins, which is load-bearing
+        // rather than stylistic. Zig's result-location semantics let this
+        // assignment construct the new value IN PLACE, so the union's active
+        // field has already become `.wait` by the time the block body runs --
+        // reading `self.cancel_status.queued` there panics with "access of
+        // union field 'queued' while field 'wait' is active".
+        //
+        // Found by forNet's SSE server test, which reaches this through
+        // io.cancelAll() on shutdown; it aborted the entire test binary.
+        const cancel_target = self.cancel_status.queued.target;
         self.cancel_status = status: {
             result catch |err| switch (err) {
                 error.NotRunning => break :status .next,
@@ -374,7 +432,7 @@ pub const IO = struct {
                 error.Unexpected => unreachable,
             };
             // Wait for the target operation to complete or abort.
-            break :status .{ .wait = .{ .target = self.cancel_status.queued.target } };
+            break :status .{ .wait = .{ .target = cancel_target } };
         };
     }
 
@@ -447,7 +505,10 @@ pub const IO = struct {
                         op.dir_fd,
                         op.file_path,
                         op.flags,
-                        op.mask,
+                        // STATX became a packed struct(u32) in 0.16, the same
+                        // shape change PROT went through. The op still carries
+                        // a raw u32 mask because that is what callers build.
+                        @bitCast(op.mask),
                         op.statxbuf,
                     );
                 },
@@ -616,7 +677,7 @@ pub const IO = struct {
                                 .PERM => error.AccessDenied,
                                 .EXIST => error.PathAlreadyExists,
                                 .BUSY => error.DeviceBusy,
-                                .OPNOTSUPP => error.FileLocksNotSupported,
+                                .OPNOTSUPP => @import("../zigcompat.zig").file_locks_err,
                                 .AGAIN => error.WouldBlock,
                                 .TXTBSY => error.FileBusy,
                                 else => |errno| stdx.unexpected_errno("openat", errno),
@@ -1230,14 +1291,44 @@ pub const IO = struct {
         self.enqueue(completion);
     }
 
-    /// Best effort to synchronously transfer bytes to the kernel.
+    /// Best effort to synchronously transfer bytes to the kernel. null means
+    /// "use send()", as on every backend.
+    ///
+    /// Raw sendto(2). This called std.posix.send, which 0.16 removed; nothing
+    /// referenced send_now until forIO's C ABI did, so it had never compiled.
+    /// MSG_NOSIGNAL matches the ring's send: a peer reset is an error, not SIGPIPE.
     pub fn send_now(self: *IO, socket: socket_t, buffer: []const u8) ?usize {
         _ = self;
-        return posix.send(socket, buffer, posix.MSG.DONTWAIT) catch |err| switch (err) {
-            error.WouldBlock => return null,
-            // To avoid duplicating error handling, force the caller to fallback to normal send.
-            else => return null,
+        const rc = linux.sendto(socket, buffer.ptr, buffer.len, posix.MSG.DONTWAIT | posix.MSG.NOSIGNAL, null, 0);
+        return switch (linux.errno(rc)) {
+            .SUCCESS => rc,
+            // WouldBlock and every error alike: the caller falls back to send(),
+            // which reports the error, so its handling stays in one place.
+            else => null,
         };
+    }
+
+    /// Make the current run_for_ns() -- or the next one, if none is running --
+    /// return promptly. Safe from any thread and from a callback. Wakes
+    /// coalesce: several before one return count once.
+    ///
+    /// Without it nothing could interrupt run_for_ns(): a stop requested from
+    /// another thread waited out the caller's whole timeout.
+    ///
+    /// Writes the eventfd, which completes the read run_for_ns() keeps armed and
+    /// so ends io_uring_enter's wait.
+    pub fn wake(self: *IO) void {
+        if (self.woken.swap(true, .seq_cst)) return;
+        const one: u64 = 1;
+        // An eventfd write fails only at a counter of 2^64-2; wakes coalesce long
+        // before that.
+        _ = linux.write(self.wake_fd, std.mem.asBytes(&one), @sizeOf(u64));
+    }
+
+    fn on_wake_read(self: *IO, _: *Completion, result: ReadError!usize) void {
+        // The count does not matter: `woken` is what run_for_ns() reads.
+        _ = result catch {};
+        self.wake_armed = false;
     }
 
     pub const StatxError = error{
@@ -1245,7 +1336,7 @@ pub const IO = struct {
         FileNotFound,
         NameTooLong,
         NotDir,
-    } || std.fs.File.StatError || posix.UnexpectedError;
+    } || @import("../zigcompat.zig").File.StatError || posix.UnexpectedError;
 
     pub fn statx(
         self: *IO,
@@ -1449,7 +1540,7 @@ pub const IO = struct {
         assert(event != INVALID_EVENT);
         _ = self;
 
-        posix.close(event);
+        @import("../zigcompat.zig").close(event);
     }
 
     pub const socket_t = posix.socket_t;
@@ -1457,7 +1548,7 @@ pub const IO = struct {
 
     /// Creates a TCP socket that can be used for async operations with the IO instance.
     pub fn open_socket_tcp(self: *IO, family: u32, options: TCPOptions) !socket_t {
-        const fd = try posix.socket(
+        const fd = try @import("../zigcompat.zig").socket(
             family,
             posix.SOCK.STREAM | posix.SOCK.CLOEXEC,
             posix.IPPROTO.TCP,
@@ -1471,7 +1562,7 @@ pub const IO = struct {
     /// Creates a UDP socket that can be used for async operations with the IO instance.
     pub fn open_socket_udp(self: *IO, family: u32) !socket_t {
         _ = self;
-        return try posix.socket(
+        return try @import("../zigcompat.zig").socket(
             family,
             std.posix.SOCK.DGRAM | posix.SOCK.CLOEXEC,
             posix.IPPROTO.UDP,
@@ -1481,7 +1572,7 @@ pub const IO = struct {
     /// Closes a socket opened by the IO instance.
     pub fn close_socket(self: *IO, socket: socket_t) void {
         _ = self;
-        posix.close(socket);
+        @import("../zigcompat.zig").close(socket);
     }
 
     /// Listen on the given TCP socket.
@@ -1502,7 +1593,8 @@ pub const IO = struct {
 
     /// Opens a directory with read only access.
     pub fn open_dir(dir_path: []const u8) !fd_t {
-        return posix.open(dir_path, .{ .CLOEXEC = true, .ACCMODE = .RDONLY }, 0);
+        // 0.16 removed posix.open; openat at AT.FDCWD is the same call.
+        return posix.openat(posix.AT.FDCWD, dir_path, .{ .CLOEXEC = true, .ACCMODE = .RDONLY }, 0);
     }
 
     pub const fd_t = posix.fd_t;
@@ -1651,7 +1743,7 @@ pub const IO = struct {
 
         const fd = try posix.openat(dir_fd, relative_path, flags, mode);
         // TODO Return a proper error message when the path exists or does not exist (init/start).
-        errdefer posix.close(fd);
+        errdefer @import("../zigcompat.zig").close(fd);
 
         {
             // Make sure we're getting the type of file descriptor we expect.
@@ -1720,7 +1812,7 @@ pub const IO = struct {
                         "of the file instead...", .{});
 
                     const sector_size = constants.sector_size;
-                    const sector: [sector_size]u8 align(sector_size) = [_]u8{0} ** sector_size;
+                    const sector: [sector_size]u8 align(sector_size) = @splat(0);
 
                     // Handle partial writes where the physical sector is
                     // less than a logical sector:
@@ -1837,14 +1929,14 @@ pub const IO = struct {
     fn fs_supports_direct_io(dir_fd: fd_t) !bool {
         if (!@hasField(posix.O, "DIRECT")) return false;
 
-        var cookie: [16]u8 = .{'0'} ** 16;
+        var cookie: [16]u8 = @splat('0');
         _ = stdx.array_print(16, &cookie, "{0x}", .{std.crypto.random.int(u64)});
 
         const path: [:0]const u8 = "fs_supports_direct_io-" ++ cookie ++ "";
         const dir = std.fs.Dir{ .fd = dir_fd };
         const flags: posix.O = .{ .CLOEXEC = true, .CREAT = true, .TRUNC = true };
         const fd = try posix.openatZ(dir_fd, path, flags, 0o666);
-        defer posix.close(fd);
+        defer @import("../zigcompat.zig").close(fd);
         defer dir.deleteFile(path) catch {};
 
         while (true) {
@@ -1852,7 +1944,7 @@ pub const IO = struct {
             const res = os.linux.openat(dir_fd, path, dir_flags, 0);
             switch (os.linux.E.init(res)) {
                 .SUCCESS => {
-                    posix.close(@intCast(res));
+                    @import("../zigcompat.zig").close(@intCast(res));
                     return true;
                 },
                 .INTR => continue,

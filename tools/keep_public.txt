@@ -1,0 +1,9 @@
+# keep_public.txt — the public C-ABI of the sealed libaio.a, read by
+# tools/wrap.zig. Everything else in the archive goes internal.
+#
+# The public surface is src/c_abi.zig's `export fn zaio_*`, declared in
+# include/zaio.h. Each glob is ANCHORED at the start of the symbol, one line per
+# object format: Mach-O prefixes C names with '_', ELF and COFF do not. A
+# leading '*' would also keep any internal name that merely ends in zaio_...
+_zaio_*
+zaio_*

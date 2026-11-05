@@ -6,8 +6,9 @@ const posix = std.posix;
 const assert = std.debug.assert;
 
 const is_linux = builtin.target.os.tag == .linux;
+const is_windows = builtin.target.os.tag == .windows;
 
-pub const Address = std.net.Address;
+pub const Address = @import("../zigcompat.zig").Address;
 
 pub const TCPOptions = struct {
     rcvbuf: c_int,
@@ -30,17 +31,23 @@ pub fn listen(
     address: Address,
     options: ListenOptions,
 ) !Address {
-    try setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, 1);
-    try posix.bind(fd, &address.any, address.getOsSockLen());
+    // NOT on Windows. On POSIX SO_REUSEADDR lets a restarted server rebind a
+    // port still in TIME_WAIT, which Windows permits without asking. Windows'
+    // SO_REUSEADDR is a different option: it lets a SECOND socket bind a port
+    // that is already LISTENING and take its connections. Setting it there
+    // turns "restart quickly" into "hijackable listener". forNet's sock.zig
+    // makes the same call for its own Winsock listeners.
+    if (!is_windows) try setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, 1);
+    try @import("../zigcompat.zig").bind(fd, &address.any, address.getOsSockLen());
 
     // Resolve port 0 to an actual port picked by the OS.
     var address_resolved: Address = undefined;
     var addrlen: posix.socklen_t = @sizeOf(Address);
-    try posix.getsockname(fd, &address_resolved.any, &addrlen);
+    try @import("../zigcompat.zig").getSockName(fd, &address_resolved.any, &addrlen);
     assert(address_resolved.getOsSockLen() == addrlen);
     assert(address_resolved.any.family == address.any.family);
 
-    try posix.listen(fd, options.backlog);
+    try @import("../zigcompat.zig").listen(fd, options.backlog);
 
     return address_resolved;
 }
@@ -94,14 +101,39 @@ pub fn tcp_options(
         }
     }
 
-    // Set tcp no-delay
+    // TCP_NODELAY on EVERY platform. It was Linux-only, so `nodelay = true`
+    // silently did nothing on Windows and macOS, where a request/response
+    // protocol then waits on Nagle plus the peer's delayed ACK. The option is
+    // the same on POSIX and Winsock (IPPROTO_TCP, TCP_NODELAY); setsockopt()
+    // below routes Windows through Winsock. Keepalive's per-connection tunables
+    // above stay Linux-only: TCP_KEEPIDLE/KEEPINTVL/KEEPCNT have no uniform
+    // spelling elsewhere.
     if (options.nodelay) {
-        if (is_linux) {
-            try setsockopt(fd, posix.IPPROTO.TCP, posix.TCP.NODELAY, 1);
-        }
+        try setsockopt(fd, posix.IPPROTO.TCP, posix.TCP.NODELAY, 1);
     }
 }
 
 pub fn setsockopt(fd: posix.socket_t, level: i32, option: u32, value: c_int) !void {
+    if (is_windows) return setsockoptWinsock(fd, level, option, value);
     try posix.setsockopt(fd, level, option, &std.mem.toBytes(value));
+}
+
+/// 0.16's std.posix.setsockopt is `@compileError("use std.Io instead")` on
+/// Windows, and std.Io.net does not speak Winsock at all. aio's sockets ARE
+/// Winsock sockets (WSASocketW, for IOCP), so they are configured through
+/// Winsock. Failures map into posix.SetSockOptError, so callers see the same
+/// error set on every platform.
+fn setsockoptWinsock(fd: posix.socket_t, level: i32, option: u32, value: c_int) posix.SetSockOptError!void {
+    const wincompat = @import("wincompat.zig");
+    const bytes = std.mem.toBytes(value);
+    if (wincompat.setsockopt(fd, level, @intCast(option), &bytes, @intCast(bytes.len)) == 0) return;
+    return switch (wincompat.WSAGetLastError()) {
+        .WSAENOTSOCK => error.FileDescriptorNotASocket,
+        .WSAENOPROTOOPT, .WSAEINVAL => error.InvalidProtocolOption,
+        .WSAEISCONN => error.AlreadyConnected,
+        .WSAENOBUFS => error.SystemResources,
+        .WSAENETDOWN => error.NetworkDown,
+        .WSAEACCES => error.PermissionDenied,
+        else => error.Unexpected,
+    };
 }

@@ -1,6 +1,9 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const posix = std.posix;
+// 0.16 deleted most of std.posix's syscall surface. darwin_posix.zig restores
+// the calls this file makes, with 0.15.2's errno mappings intact, and is a
+// straight re-export of std.posix when built on 0.15.2.
+const posix = @import("./darwin_posix.zig");
 const mem = std.mem;
 const assert = std.debug.assert;
 const log = std.log.scoped(.io);
@@ -8,7 +11,10 @@ const log = std.log.scoped(.io);
 const stdx = @import("../stdx.zig");
 const constants = @import("../constants.zig");
 const common = @import("./common.zig");
-const Address = std.net.Address;
+// std.net was removed outright in 0.16, not renamed. zigcompat.Address is the
+// sockaddr carrier aio supplies in its place, and is std.net.Address on 0.15.2.
+const Address = @import("../zigcompat.zig").Address;
+const errorNames = @import("../zigcompat.zig").errorNames;
 const QueueType = @import("../queue.zig").QueueType;
 const Time = @import("../time.zig").Time;
 const buffer_limit = @import("../io.zig").buffer_limit;
@@ -24,6 +30,12 @@ pub const IO = struct {
     timeouts: QueueType(Completion) = QueueType(Completion).init(.{ .name = "io_timeouts" }),
     completed: QueueType(Completion) = QueueType(Completion).init(.{ .name = "io_completed" }),
     io_pending: QueueType(Completion) = QueueType(Completion).init(.{ .name = "io_pending" }),
+    /// Set by wake(), consumed by run_for_ns(). See wake().
+    woken: std.atomic.Value(bool) = .init(false),
+
+    /// The EVFILT_USER identifier wake() triggers. open_event() counts up from
+    /// 1, so the top of the u32 range cannot collide with an event it hands out.
+    const wake_ident: usize = std.math.maxInt(u32);
 
     pub fn init(entries: u12, flags: u32) !IO {
         _ = entries;
@@ -31,6 +43,16 @@ pub const IO = struct {
 
         const kq = try posix.kqueue();
         assert(kq > -1);
+        errdefer posix.close(kq);
+
+        // Registered once, here, so wake() is a single trigger from any thread.
+        // flush() recognizes it by filter and ident; no completion stands behind
+        // it and io_inflight does not count it.
+        var kev = mem.zeroes([1]posix.Kevent);
+        kev[0].ident = wake_ident;
+        kev[0].filter = posix.system.EVFILT.USER;
+        kev[0].flags = posix.system.EV.ADD | posix.system.EV.ENABLE | posix.system.EV.CLEAR;
+        _ = try posix.kevent(kq, &kev, kev[0..0], null);
         // 显式初始化所有字段，确保队列被正确初始化
         return IO{
             .kq = kq,
@@ -82,10 +104,42 @@ pub const IO = struct {
             nanoseconds,
         );
 
+        // The timer lives in this frame: however this returns, it must not stay queued.
+        defer if (!timed_out) self.discard_timer(&completion);
+
         // Loop until our timeout completion is processed above, which sets timed_out to true.
         // LLVM shouldn't be able to cache timed_out's value here since its address escapes above.
         while (!timed_out) {
+            // Woken: take what is ready without waiting, then return.
+            if (self.woken.swap(false, .seq_cst)) return self.flush(false);
             try self.flush(true);
+        }
+    }
+
+    /// Make the current run_for_ns() -- or the next one, if none is running --
+    /// return promptly. Safe from any thread and from a callback. Wakes
+    /// coalesce: several before one return count once.
+    ///
+    /// Triggers the EVFILT_USER event init() registered, which ends a blocked
+    /// kevent(). kevent() is safe to call on a kqueue another thread waits on.
+    pub fn wake(self: *IO) void {
+        if (self.woken.swap(true, .seq_cst)) return;
+        var kev = mem.zeroes([1]posix.Kevent);
+        kev[0].ident = wake_ident;
+        kev[0].filter = posix.system.EVFILT.USER;
+        kev[0].fflags = posix.system.NOTE.TRIGGER;
+        // Fails only without kernel memory. The flag stays set and run_for_ns()
+        // sees it at its next check, bounded by its timer.
+        _ = posix.kevent(self.kq, &kev, kev[0..0], null) catch {};
+    }
+
+    /// Take run_for_ns()'s frame-local timer off whichever queue holds it: the
+    /// timer queue, or `completed` for a zero-length run.
+    fn discard_timer(self: *IO, completion: *Completion) void {
+        if (self.timeouts.contains(completion)) {
+            self.timeouts.remove(completion);
+        } else if (self.completed.contains(completion)) {
+            self.completed.remove(completion);
         }
     }
 
@@ -129,15 +183,21 @@ pub const IO = struct {
                 &ts,
             );
 
-            // Mark the io events submitted only after kevent() successfully processed them.
-            self.io_inflight += change_events;
-            self.io_inflight -= new_events;
-
+            var wake_events: usize = 0;
             for (events[0..new_events]) |event| {
+                // wake(): no completion behind it, never counted in io_inflight.
+                if (event.filter == posix.system.EVFILT.USER and event.ident == wake_ident) {
+                    wake_events += 1;
+                    continue;
+                }
                 const completion: *Completion = @ptrFromInt(event.udata);
                 assert(completion.link.next == null);
                 self.completed.push(completion);
             }
+
+            // Mark the io events submitted only after kevent() successfully processed them.
+            self.io_inflight += change_events;
+            self.io_inflight -= new_events - wake_events;
         }
 
         var completed = self.completed;
@@ -250,13 +310,24 @@ pub const IO = struct {
         },
     };
 
+    /// Whether an operation's result type (E!T) can carry error.WouldBlock.
+    fn canWouldBlock(comptime R: type) bool {
+        const set = errorNames(@typeInfo(R).error_union.error_set) orelse return true;
+        for (set) |e| {
+            if (std.mem.eql(u8, e, "WouldBlock")) return true;
+        }
+        return false;
+    }
+
     fn submit(
         self: *IO,
         context: anytype,
         comptime callback: anytype,
         completion: *Completion,
         comptime operation_tag: std.meta.Tag(Operation),
-        operation_data: std.meta.TagPayload(Operation, operation_tag),
+        // std.meta.TagPayload was removed in 0.16. @FieldType is the replacement
+        // and exists on 0.15.2 too, so this needs no version branch.
+        operation_data: @FieldType(Operation, @tagName(operation_tag)),
         comptime OperationImpl: type,
     ) void {
         const on_complete_fn = struct {
@@ -265,17 +336,23 @@ pub const IO = struct {
                 const op_data = &@field(_completion.operation, @tagName(operation_tag));
                 const result = OperationImpl.do_operation(op_data);
 
-                // Requeue onto io_pending if error.WouldBlock.
+                // Requeue onto io_pending if error.WouldBlock. Only an
+                // operation whose error set has WouldBlock can report it: on
+                // Zig 0.16 posix.PWriteError has none (a regular-file pwrite
+                // never returns EAGAIN), and a switch prong for an error the
+                // set lacks does not compile, so write is checked, not listed.
                 switch (operation_tag) {
                     .accept, .connect, .read, .write, .send, .recv => {
-                        _ = result catch |err| switch (err) {
-                            error.WouldBlock => {
-                                _completion.link = .{};
-                                io.io_pending.push(_completion);
-                                return;
-                            },
-                            else => {},
-                        };
+                        if (comptime canWouldBlock(@TypeOf(result))) {
+                            _ = result catch |err| switch (err) {
+                                error.WouldBlock => {
+                                    _completion.link = .{};
+                                    io.io_pending.push(_completion);
+                                    return;
+                                },
+                                else => {},
+                            };
+                        }
                     },
                     else => {},
                 }
@@ -742,7 +819,12 @@ pub const IO = struct {
                     // below) is _synchronous_, so it's safe to call fs_sync after it has
                     // completed.
                     const result = posix.pwrite(op.fd, op.buf[0..op.len], op.offset);
-                    try fs_sync(op.fd);
+                    // fs_sync's fsync fallback can report Canceled on 0.16, which
+                    // WriteError does not carry; everything else it reports does.
+                    fs_sync(op.fd) catch |err| return switch (err) {
+                        error.Canceled => error.Unexpected,
+                        else => |e| e,
+                    };
 
                     return result;
                 }
