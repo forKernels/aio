@@ -154,6 +154,13 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/c_abi.zig"),
         .target = target,
         .optimize = optimize,
+        // A consumer may fold libaio.a into a shared library (forIO's
+        // libforio.so) or link it into a PIE (gcc's default): without PIC
+        // that fails on R_X86_64_32S against .rodata.
+        .pic = true,
+        // ReleaseSafe on x86 non-Windows calls __zig_probe_stack (compiler_rt),
+        // which the sealed archive does not carry (forGeo 78c8f5e).
+        .stack_check = false,
     });
     cabi_module.addImport("reify", reify_module);
     const cabi_obj = b.addObject(.{ .name = "aio_cabi", .root_module = cabi_module });
