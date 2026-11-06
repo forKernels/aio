@@ -428,6 +428,19 @@ fn wrapMain(a: std.mem.Allocator, args: []const []const u8, objcopy_override: ?[
         localized += 1;
     }
 
+    // ---- x64 COFF: hide .pdata from ld -r (forDSP add54ee, forIO 4dba1ac) ----
+    // GNU ld (pe-x86-64) sorts the output .pdata rows by their raw begin offset
+    // even under -r, but leaves the relocations in place, so rows pair with the
+    // wrong functions: SEH, debuggers and backtraces read garbage, and MSVC
+    // link.exe refuses the object (LNK1223). Under another name the rows stay in
+    // input order; the keep pass below renames it back. Every entry in objs is
+    // wrap's own copy, so the inputs are never mutated.
+    const coff_x64 = blk: {
+        const head = try readFileAlloc(a, objs.items[0], 1 << 30);
+        break :blk head.len >= 2 and head[0] == 0x64 and head[1] == 0x86;
+    };
+    if (coff_x64) for (objs.items) |o| try run(a, &.{ objcopy, "--rename-section", ".pdata=.pdatx", o });
+
     // ---- ld -r : all objects -> combined.o ----
     const combined = try std.fs.path.join(a, &.{ workdir, "aio_combined.o" });
     {
@@ -435,6 +448,15 @@ fn wrapMain(a: std.mem.Allocator, args: []const []const u8, objcopy_override: ?[
         try argv.appendSlice(a, &.{ "ld", "-r", "-o", combined });
         for (objs.items) |o| try argv.append(a, o);
         try run(a, argv.items);
+    }
+
+    if (coff_x64) {
+        // Self-check: a .pdata here came from an input the rename missed, and ld sorted it.
+        const hdrs = try capture(a, &.{ "objdump", "-h", combined });
+        if (std.mem.indexOf(u8, hdrs, " .pdata ") != null) {
+            std.debug.print("wrap: GATE FAILED -- ld -r output has a sorted .pdata (an input escaped the rename)\n", .{});
+            return error.GateFailed;
+        }
     }
 
     // ---- keep ONLY the listed globs global; all Fortran goes internal ----
@@ -456,6 +478,7 @@ fn wrapMain(a: std.mem.Allocator, args: []const []const u8, objcopy_override: ?[
             try argv.append(a, "--keep-global-symbol");
             try argv.append(a, g);
         }
+        if (coff_x64) try argv.appendSlice(a, &.{ "--rename-section", ".pdatx=.pdata" });
         try argv.append(a, combined);
         try run(a, argv.items);
     }
