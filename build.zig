@@ -6,11 +6,29 @@ const zig16 = @import("builtin").zig_version.order(.{ .major = 0, .minor = 16, .
 /// the cwd handle is only the API's entry point, not a base for the lookup.
 fn pathExists(b: *std.Build, path: []const u8) bool {
     if (zig16) {
-        std.Io.Dir.cwd().access(b.graph.io, path, .{}) catch return false;
+        std.Io.Dir.cwd().access(b.graph.io, path, .{}) catch {
+            // A path that is absent cannot be declared (configure fails with
+            // FileSystemFailure), so re-run build() every time instead.
+            if (comptime configureIsCached()) b.graph.poisonCache();
+            return false;
+        };
+        if (comptime configureIsCached()) b.dependOnFileMetadata(b.graph.cwdRelativePath(path));
     } else {
         std.fs.cwd().access(path, .{}) catch return false;
     }
     return true;
+}
+
+/// `sub` under the build root. 0.17 dropped Build.pathFromRoot when
+/// b.build_root became b.root (a Cache.Path); feature-tested.
+fn rootPath(b: *std.Build, sub: []const u8) []const u8 {
+    if (comptime @hasDecl(std.Build, "pathFromRoot")) return b.pathFromRoot(sub);
+    return b.root.joinString(b.allocator, sub) catch @panic("OOM");
+}
+
+/// 0.17 caches the configure phase: build() re-runs only when a DECLARED input changed.
+fn configureIsCached() bool {
+    return @hasDecl(std.Build, "dependOnDirectoryContents");
 }
 
 pub fn build(b: *std.Build) void {
@@ -27,7 +45,7 @@ pub fn build(b: *std.Build) void {
         std.builtin.OptimizeMode,
         "optimize",
         "Prioritize performance, safety, or binary size (delivery default: ReleaseSafe)",
-    ) orelse .ReleaseSafe;
+    ) orelse std.builtin.OptimizeMode.ReleaseSafe;
 
     // Reflective type construction, selected BY COMPILER VERSION.
     //
@@ -84,7 +102,7 @@ pub fn build(b: *std.Build) void {
     //
     // Linux and Darwin reference no ftim_* symbol, so nothing changes there.
     if (target.result.os.tag == .windows and target.result.cpu.arch == .x86_64) {
-        const archive = b.pathFromRoot(if (target.result.abi == .msvc)
+        const archive = rootPath(b, if (target.result.abi == .msvc)
             "../forTime/prebuilt/winX86/fortime.lib"
         else
             "../forTime/prebuilt/winX86/libfortime.a");
@@ -136,6 +154,13 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/c_abi.zig"),
         .target = target,
         .optimize = optimize,
+        // A consumer may fold libaio.a into a shared library (forIO's
+        // libforio.so) or link it into a PIE (gcc's default): without PIC
+        // that fails on R_X86_64_32S against .rodata.
+        .pic = true,
+        // ReleaseSafe on x86 non-Windows calls __zig_probe_stack (compiler_rt),
+        // which the sealed archive does not carry (forGeo 78c8f5e).
+        .stack_check = false,
     });
     cabi_module.addImport("reify", reify_module);
     const cabi_obj = b.addObject(.{ .name = "aio_cabi", .root_module = cabi_module });
@@ -170,10 +195,10 @@ pub fn build(b: *std.Build) void {
                 .optimize = .ReleaseSafe,
             }),
         });
-        const archive = b.pathFromRoot(b.fmt("prebuilt/{s}/libaio.a", .{short}));
+        const archive = rootPath(b, b.fmt("prebuilt/{s}/libaio.a", .{short}));
         const seal = b.addRunArtifact(wrap_exe);
         seal.addArg(archive); // <out_lib>
-        seal.addArg(b.pathFromRoot(b.fmt(".zig-cache/wrap/{s}", .{short}))); // <workdir>
+        seal.addArg(rootPath(b, b.fmt(".zig-cache/wrap/{s}", .{short}))); // <workdir>
         seal.addPrefixedFileArg("@", b.path("tools/keep_public.txt")); // <keep>
         seal.addFileArg(cabi_obj.getEmittedBin()); // <obj>
         seal.has_side_effects = true; // runs nm/ld/objcopy/ar on the host -- never cache-skip
@@ -192,7 +217,7 @@ pub fn build(b: *std.Build) void {
         cabi_test.root_module.addObjectFile(.{ .cwd_relative = archive });
         if (target.result.os.tag == .windows) {
             // aio's Windows clocks are forTime's (src/time.zig).
-            cabi_test.root_module.addObjectFile(.{ .cwd_relative = b.pathFromRoot("../forTime/prebuilt/winX86/libfortime.a") });
+            cabi_test.root_module.addObjectFile(.{ .cwd_relative = rootPath(b, "../forTime/prebuilt/winX86/libfortime.a") });
             for ([_][]const u8{ "ws2_32", "mswsock", "ntdll", "kernel32" }) |name| cabi_test.root_module.linkSystemLibrary(name, .{});
         }
         cabi_test.step.dependOn(&seal.step);

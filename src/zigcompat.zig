@@ -263,3 +263,27 @@ pub fn getSockName(fd: std.posix.socket_t, addr: *std.posix.sockaddr, len: *std.
 /// problem than a rename. Shimmable where the @Type builtins were not, because
 /// an error literal always exists — `error.Whatever` defines it on the spot.
 pub const file_locks_err = if (zig16) error.FileLocksUnsupported else error.FileLocksNotSupported;
+
+/// The names in error set E, null for anyerror. 0.17 made @typeInfo(E).error_set
+/// a struct of `error_names`; 0.15.2 and 0.16 give ?[]const Type.Error.
+pub fn errorNames(comptime E: type) ?[]const [:0]const u8 {
+    const info = @typeInfo(E).error_set;
+    if (comptime @typeInfo(@TypeOf(info)) == .@"struct") return info.error_names;
+    const errors = info orelse return null;
+    var names: [errors.len][:0]const u8 = undefined;
+    for (errors, &names) |e, *n| n.* = e.name;
+    const final = names;
+    return &final;
+}
+
+/// T's struct fields with `.name` and `.type`. 0.17 split @typeInfo(T).@"struct".fields
+/// into parallel field_names/field_types slices; 0.15.2 and 0.16 get their own list back.
+pub const StructField = if (@hasDecl(std.builtin.Type, "StructField")) std.builtin.Type.StructField else struct { name: [:0]const u8, type: type };
+pub fn structFields(comptime T: type) []const StructField {
+    const info = @typeInfo(T).@"struct";
+    if (comptime @hasDecl(std.builtin.Type, "StructField")) return info.fields;
+    var out: [info.field_names.len]StructField = undefined;
+    for (info.field_names, info.field_types, &out) |n, t, *f| f.* = .{ .name = n, .type = t };
+    const final = out;
+    return &final;
+}
